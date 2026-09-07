@@ -1,0 +1,8 @@
+.env 
+knowledge_base/ 
+processed_cache/ 
+qdrant_storage/ 
+__pycache__/ 
+*.pyc 
+venv/ 
+rag_py311/ 

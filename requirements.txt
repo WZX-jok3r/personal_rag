@@ -1,0 +1,29 @@
+
+# 可以安装bfe-reranker实现rerank
+#pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+#pip install FlagEmbedding -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+
+# 向量库
+qdrant-client>=1.13.0
+
+# webui
+gradio>=5.5.0
+
+# env
+python-dotenv>=1.0.0
+
+#文档解析，Windows精简依赖
+unstructured[docx,pdf,xlsx,md]>=0.16.0
+pymupdf>=1.26.0
+openpyxl>=3.1.5
+
+# llm
+ollama>=0.6.2
+rank_bm25>=0.2.2
+
+# ========= LangChain 1.x + LangGraph Agent栈 =========
+langchain>=1.2.0
+langchain-text-splitters>=1.1.0
+langchain-ollama>=0.2.0
+langgraph>=0.2.35

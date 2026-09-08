@@ -3,6 +3,7 @@
 #pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 #pip install FlagEmbedding -i https://pypi.tuna.tsinghua.edu.cn/simple
 
+requests>=2.31.0
 
 # 向量库
 qdrant-client>=1.13.0

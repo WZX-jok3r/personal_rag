@@ -13,7 +13,7 @@ eval_runner.py - 评测脚本
 用法:
     python src/eval_runner.py              # 运行全部评测
     python src/eval_runner.py --top-k 10   # 指定 K 值
-    python src/eval_runner.py --output result.json  # 保存详细结果
+    python src/eval_runner.py --output result_v1.json  # 保存详细结果
 """
 
 import json
@@ -28,6 +28,50 @@ from rag_pipeline import get_pipeline, RAGPipeline
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# 评测输出统一目录
+OUTPUT_EVAL_DIR = Path("output/eval")
+
+
+def dump_text_report(report: Dict[str, Any], txt_path: Path):
+    """把评测报告写入txt文件"""
+    s = report["summary"]
+    lines = []
+    lines.append("=" * 60)
+    lines.append("📊 RAG 评测报告")
+    lines.append("=" * 60)
+    lines.append(f"总问题数: {s['total_questions']}")
+    lines.append(f"通过: {s['passed']} | 失败: {s['failed']}")
+    lines.append(f"通过率: {s['pass_rate'] * 100:.2f}%")
+    lines.append(f"Recall@K 命中率: {s['recall_at_k_rate'] * 100:.2f}% (K={s['top_k']})")
+    lines.append(f"平均关键词命中率: {s['avg_keyword_hit_rate'] * 100:.2f}%")
+    lines.append("=" * 60)
+    lines.append("")
+
+    lines.append("📁 按来源文件统计:")
+    for src, stats in report["by_source"].items():
+        lines.append(
+            f"  {src}: 通过 {stats['passed']}/{stats['total']} (Recall命中 {stats['recall_hits']}/{stats['total']})")
+    lines.append("")
+
+    lines.append("📂 按类别统计:")
+    for cat, stats in report["by_category"].items():
+        lines.append(
+            f"  {cat}: 通过 {stats['passed']}/{stats['total']}, 平均关键词命中率 {stats['avg_keyword_hit'] * 100:.2f}%")
+    lines.append("")
+
+    if report["failed_cases"]:
+        lines.append("❌ 失败案例:")
+        for i, fc in enumerate(report["failed_cases"], 1):
+            lines.append(f"  {i}. [{fc['expected_source']}] {fc['question'][:80]}...")
+            lines.append(f"     Recall@K={fc['recall_at_k']}, KeywordHit={fc['keyword_hit_rate'] * 100:.1f}%")
+            lines.append(f"     回答: {fc['actual_answer'][:150]}...")
+            lines.append("")
+
+    lines.append("=" * 60)
+    content = "\n".join(lines)
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(content)
 
 
 class EvalRunner:
@@ -74,7 +118,7 @@ class EvalRunner:
         retrieved_sources = [s["source"] for s in sources]
         recall_at_k = expected_source in retrieved_sources if expected_source else None
 
-        # 2. 计算 Source Rank: 期望来源在结果中的排名（1-based，未找到为 -1）
+        # 2. 计算 Source Rank: 期望来源在结果中的排名（1‑based，未找到为 -1）
         source_rank = -1
         if expected_source:
             for i, src in enumerate(retrieved_sources):
@@ -250,56 +294,18 @@ class EvalRunner:
         print("\n" + "=" * 60)
 
 
-def dump_text_report(report: Dict[str, Any], txt_path: Path):
-    """把评测报告写入txt文件"""
-    s = report["summary"]
-    lines = []
-    lines.append("=" * 60)
-    lines.append("📊 RAG 评测报告")
-    lines.append("=" * 60)
-    lines.append(f"总问题数: {s['total_questions']}")
-    lines.append(f"通过: {s['passed']} | 失败: {s['failed']}")
-    lines.append(f"通过率: {s['pass_rate'] * 100:.2f}%")
-    lines.append(f"Recall@K 命中率: {s['recall_at_k_rate'] * 100:.2f}% (K={s['top_k']})")
-    lines.append(f"平均关键词命中率: {s['avg_keyword_hit_rate'] * 100:.2f}%")
-    lines.append("=" * 60)
-    lines.append("")
-
-    lines.append("📁 按来源文件统计:")
-    for src, stats in report["by_source"].items():
-        lines.append(
-            f"  {src}: 通过 {stats['passed']}/{stats['total']} (Recall命中 {stats['recall_hits']}/{stats['total']})")
-    lines.append("")
-
-    lines.append("📂 按类别统计:")
-    for cat, stats in report["by_category"].items():
-        lines.append(
-            f"  {cat}: 通过 {stats['passed']}/{stats['total']}, 平均关键词命中率 {stats['avg_keyword_hit'] * 100:.2f}%")
-    lines.append("")
-
-    if report["failed_cases"]:
-        lines.append("❌ 失败案例:")
-        for i, fc in enumerate(report["failed_cases"], 1):
-            lines.append(f"  {i}. [{fc['expected_source']}] {fc['question'][:80]}...")
-            lines.append(f"     Recall@K={fc['recall_at_k']}, KeywordHit={fc['keyword_hit_rate'] * 100:.1f}%")
-            lines.append(f"     回答: {fc['actual_answer'][:150]}...")
-            lines.append("")
-
-    lines.append("=" * 60)
-    content = "\n".join(lines)
-    with open(txt_path, "w", encoding="utf-8") as f:
-        f.write(content)
-
-
 def main():
     parser = argparse.ArgumentParser(description="RAG 评测脚本")
-    # 修改后
     default_dataset_path = Path(TEST_DATASET_FILE).with_suffix(".jsonl")
     parser.add_argument("--dataset", type=str, default=str(default_dataset_path),
                         help="评测集路径 (JSONL 格式)")
-    parser.add_argument("--top-k", type=int, default=5, help="检索 Top-K")
-    parser.add_argument("--output", type=str, default="eval_result.json", help="json结果保存路径")
+    parser.add_argument("--top-k", type=int, default=5, help="检索 Top‑K")
+    # 这里只传文件名，不要文件夹路径
+    parser.add_argument("--output", type=str, default="eval_result.json", help="输出文件名，保存到 output/eval/")
     args = parser.parse_args()
+
+    # 自动创建输出目录
+    OUTPUT_EVAL_DIR.mkdir(parents=True, exist_ok=True)
 
     dataset_path = Path(args.dataset)
     if not dataset_path.exists():
@@ -317,7 +323,7 @@ def main():
     runner = EvalRunner(pipeline, top_k=args.top_k)
 
     # 执行评测
-    logger.info(f"[Eval] 开始评测 (Top-K={args.top_k})...")
+    logger.info(f"[Eval] 开始评测 (Top‑K={args.top_k})...")
     eval_result = runner.run(dataset_path)
 
     if not eval_result:
@@ -326,14 +332,16 @@ def main():
     # 打印报告到控制台
     runner.print_report(eval_result["report"])
 
-    # 保存json结果
-    output_path = Path(args.output)
+    # 拼接完整输出路径
+    output_path = OUTPUT_EVAL_DIR / args.output
+    txt_output_path = output_path.with_suffix(".txt")
+
+    # 保存json
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(eval_result, f, ensure_ascii=False, indent=2)
     logger.info(f"[Eval] JSON详细结果已保存: {output_path}")
 
-    # 新增：输出同名txt报告，把后缀换成 .txt
-    txt_output_path = output_path.with_suffix(".txt")
+    # 保存txt报告
     dump_text_report(eval_result["report"], txt_output_path)
     logger.info(f"[Eval] TXT评测报告已保存: {txt_output_path}")
 

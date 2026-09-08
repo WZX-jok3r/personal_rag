@@ -1,0 +1,73 @@
+{"question":"路由器整机质保多长时间？","golden_answer":"旧版本V0.9文档路由器质保12个月，新版本V1.0文档路由器整机质保24个月，需要区分文档版本。","source_file":"contract_snippet.md","expected_keywords":["路由器","质保","V0.9","12个月","V1.0","24个月"]}
+{"question":"PET肤感门板的单价是多少？","golden_answer":"PET肤感门板单价210元，数量34，白色刨花板基材。","source_file":"cost_data.xlsx","expected_keywords":["PET肤感门板","210","34","白色","刨花板基材"]}
+{"question":"颗粒板柜体板材用的什么品牌和封边方式？","golden_answer":"颗粒板柜体板材单价135元，采用兔宝宝品牌、PUR封边。","source_file":"cost_data.xlsx","expected_keywords":["颗粒板柜体板材","兔宝宝","PUR封边","135"]}
+{"question":"铰链是什么型号，有什么功能？","golden_answer":"铰链为悍高三段力，单价28元，数量20，具备柜门阻尼缓冲功能。","source_file":"cost_data.xlsx","expected_keywords":["铰链","悍高","三段力","28","阻尼缓冲"]}
+{"question":"多层板地柜板材是什么用途？","golden_answer":"多层板地柜板材单价182元，数量28，用于厨房地柜。","source_file":"cost_data.xlsx","expected_keywords":["多层板地柜板材","182","厨房地柜"]}
+{"question":"安装人工怎么计费？","golden_answer":"安装人工单价85元，数量1，按套计费。","source_file":"cost_data.xlsx","expected_keywords":["安装人工","85","按套计费"]}
+{"question":"整个橱柜项目中数量和单价分别是多少，总成本怎么算？","golden_answer":"项目含铰链(28×20)、颗粒板柜体板材(135×42)、多层板地柜板材(182×28)、PET肤感门板(210×34)、安装人工(85×1)，总成本为各项单价×数量之和。","source_file":"cost_data.xlsx","expected_keywords":["铰链","颗粒板柜体板材","多层板地柜板材","PET肤感门板","安装人工","数量"]}
+{"question":"docx‑sample‑with‑images.docx这份文档的标题是什么？","golden_answer":"文档标题为Document with Embedded Image","source_file":"docx-sample-with-images.docx","expected_keywords":["Document with Embedded Image"]}
+{"question":"docx‑sample‑with‑images.docx里面包含哪两个大章节？","golden_answer":"文档包含Introduction、Discussion两个章节，文档内还嵌入一张示例图片。","source_file":"docx-sample-with-images.docx","expected_keywords":["Introduction","Discussion","Sample Image"]}
+{"question":"docx‑sample‑with‑images.docx文档中嵌入图片上写了什么文字？","golden_answer":"嵌入图片中的文字为Sample Image‑ExampleFiles.org","source_file":"docx-sample-with-images.docx","expected_keywords":["Sample Image","ExampleFiles.org"]}
+{"question":"docx‑sample‑with‑table.docx文档里面表格的标题是什么？","golden_answer":"表格标题为Employee Directory，用于展示员工记录示例。","source_file":"docx-sample-with-table.docx","expected_keywords":["Employee Directory","employee records"]}
+{"question":"docx‑sample‑with‑table.docx中Jettie Little属于哪个部门，薪资是多少？","golden_answer":"Jettie Little属于HR部门，岗位Associate，薪资$124,328。","source_file":"docx-sample-with-table.docx","expected_keywords":["Jettie Little","HR","Associate","124328"]}
+{"question":"Sales部门Lead岗位的员工都有谁？","golden_answer":"Sales部门Lead岗位有Dr. Dereck Keeling IV、Prof. Alphonso Littel。","source_file":"docx-sample-with-table.docx","expected_keywords":["Sales","Lead","Dr. Dereck Keeling IV","Prof. Alphonso Littel"]}
+{"question":"Finance部门的员工有哪些岗位？","golden_answer":"Finance部门员工岗位均为Developer。","source_file":"docx-sample-with-table.docx","expected_keywords":["Finance","Developer","Brigitte Ankunding Jr.","Mr. Camryn Feeney DDS","Danny Stroman"]}
+{"question":"docx‑sample‑with‑table.docx中薪资最高的员工是哪一位？","golden_answer":"薪资最高的是Prof. Alphonso Littel，薪资$144,807，Sales部门，岗位Lead。","source_file":"docx-sample-with-table.docx","expected_keywords":["Prof. Alphonso Littel","144807","Sales","Lead"]}
+{"question":"布洛芬最多多久吃一次？","golden_answer":"布洛芬间隔至少6‑8小时，一周不建议超过4次，经期偏头痛优先饭后服用。","source_file":"faq.docx","expected_keywords":["布洛芬","6‑8小时","一周","4次","经期偏头痛","饭后服用"]}
+{"question":"八段锦空腹是否可以练习？低血糖人群有什么建议？","golden_answer":"早上空腹可以练习八段锦；低血糖人群建议少量吃一点碳水再练。","source_file":"faq.docx","expected_keywords":["八段锦","空腹","低血糖","碳水"]}
+{"question":"四神汤由哪些成分组成？","golden_answer":"四神汤成分为茯苓、山药、莲子、芡实，属于食疗饮品，不能替代药物。","source_file":"faq.docx","expected_keywords":["四神汤","茯苓","山药","莲子","芡实","食疗饮品"]}
+{"question":"维A酸乳膏有哪些使用要点？","golden_answer":"维A酸乳膏晚间使用，需要避光；建立耐受；孕妇禁用。","source_file":"faq.docx","expected_keywords":["维A酸乳膏","晚间","避光","建立耐受","孕妇禁用"]}
+{"question":"R‑08路由器供电规格是多少？","golden_answer":"R‑08路由器供电为12V 1.5A。","source_file":"product_spec.txt","expected_keywords":["R‑08路由器","12V","1.5A"]}
+{"question":"R‑08路由器支持什么WiFi协议，频段情况如何？","golden_answer":"R‑08路由器采用WiFi6协议，支持2.4G+5G双频；2.4G穿墙更好，5G速率高距离短。","source_file":"product_spec.txt","expected_keywords":["R‑08路由器","WiFi6","2.4G","5G","穿墙","速率高"]}
+{"question":"R‑08路由器最大可以同时连接多少台设备？","golden_answer":"R‑08路由器最大并发设备64台。","source_file":"product_spec.txt","expected_keywords":["R‑08路由器","最大并发设备","64台"]}
+{"question":"R‑08路由器的工作温度范围是多少？","golden_answer":"R‑08路由器工作温度0‑45摄氏度。","source_file":"product_spec.txt","expected_keywords":["R‑08路由器","工作温度","0‑45摄氏度"]}
+{"question":"R‑08路由器固件安全补丁多久推送一次？","golden_answer":"R‑08路由器每90天推送一次安全补丁。","source_file":"product_spec.txt","expected_keywords":["R‑08路由器","固件","90天","安全补丁"]}
+{"question":"R‑08路由器摆放有什么注意事项？散热不好会出现什么现象？","golden_answer":"R‑08路由器不要放在密闭柜子，散热不良会导致断流。","source_file":"product_spec.txt","expected_keywords":["R‑08路由器","密闭柜子","散热不良","断流"]}
+{"question":"R‑08路由器售后质保多久，哪些情况不在保修？","golden_answer":"R‑08路由器整机质保24个月，人为进水不在保修范围。","source_file":"product_spec.txt","expected_keywords":["R‑08路由器","整机质保","24个月","人为进水","不在保修"]}
+{"question":"Windows环境使用uvx命令识别不到，有什么解决办法？","golden_answer":"Windows下需要把uv的Scripts目录加入系统PATH，否则cmd/powershell识别不到uvx命令；conda虚拟环境不会自动注入uv脚本，需要手动配置环境变量。","source_file":"tech_maunal.md","expected_keywords":["uvx","Scripts","PATH","conda","环境变量"]}
+{"question":"JS逆向包含哪些调试工具？","golden_answer":"JS逆向调试工具包含Fiddler抓http/https流量、Chrome DevTools做XHR断点调用栈hook脚本、mitmproxy脚本化中间人代理。","source_file":"tech_maunal.md","expected_keywords":["Fiddler","Chrome DevTools","XHR断点","hook","mitmproxy"]}
+{"question":"AES加密的模式、密钥长度、IV向量要求是什么？","golden_answer":"AES加密模式为CBC，密钥长度128bit，IV向量16字节。","source_file":"tech_maunal.md","expected_keywords":["AES","CBC","128bit","IV向量","16字节"]}
+{"question":"RSA加密网页端一般如何使用？","golden_answer":"网页端RSA一般使用公钥加密，私钥放在服务端。","source_file":"tech_maunal.md","expected_keywords":["RSA","公钥加密","私钥","服务端"]}
+{"question":"爬虫项目约束有哪两条？timestamp时间单位是什么？","golden_answer":"1.禁止在未授权网站大规模高频爬虫；2.接口签名参数timestamp单位是毫秒。","source_file":"tech_maunal.md","expected_keywords":["未授权网站","高频爬虫","timestamp","毫秒"]}
+{"question":"V1.2手册版本做了哪些更新？","golden_answer":"V1.0为初始版本，V1.1新增mitmproxy章节，V1.2补充Windows uvx环境变量坑点。","source_file":"tech_maunal.md","expected_keywords":["V1.0","V1.1","V1.2","mitmproxy","uvx","环境变量"]}
+{"question":"SKU BHG‑24667对应的商品名称是什么","golden_answer":"SKU BHG‑24667对应的商品名称是molestiae quas。","source_file":"pdf‑sample‑with‑table.pdf","expected_keywords":["BHG‑24667","molestiae quas"]}
+{"question":"商品名称molestiae quas对应的SKU、价格、库存是多少","golden_answer":"SKU：BHG‑24667，价格：$73.15，库存：228。","source_file":"pdf‑sample‑with‑table.pdf","expected_keywords":["BHG‑24667","molestiae quas","$73.15","228"]}
+{"question":"库存90对应的SKU、商品名称和所属分类是什么","golden_answer":"SKU：EHX‑15357，商品名称：qui fugiat adipisci，分类：Home & Garden。","source_file":"pdf‑sample‑with‑table.pdf","expected_keywords":["90","EHX‑15357","qui fugiat adipisci","Home & Garden"]}
+{"question":"Books分类下的商品SKU、商品名称、价格和库存分别是多少","golden_answer":"Books分类商品SKU：QXB‑07126，商品名称：quibusdam quaerat repudiandae，价格：$318.76，库存：101。","source_file":"pdf‑sample‑with‑table.pdf","expected_keywords":["Books","QXB‑07126","quibusdam quaerat repudiandae","$318.76","101"]}
+{"question":"SKU TGP‑17432的商品名称、价格、分类、库存是多少","golden_answer":"商品名称：sapiente qui，价格：$454.01，分类：Clothing，库存：4888。","source_file":"pdf‑sample‑with‑table.pdf","expected_keywords":["TGP‑17432","sapiente qui","$454.01","Clothing","4888"]}
+{"question":"价格454.01美元对应的SKU是什么，库存为多少","golden_answer":"价格454.01美元对应的SKU为TGP‑17432，库存4888。","source_file":"pdf‑sample‑with‑table.pdf","expected_keywords":["454.01","TGP‑17432","4888"]}
+{"question":"Health & Beauty分类包含哪些SKU","golden_answer":"Health & Beauty分类包含SKU：ILM‑24578、SBS‑21267。","source_file":"pdf‑sample‑with‑table.pdf","expected_keywords":["Health & Beauty","ILM‑24578","SBS‑21267"]}
+{"question":"SKU RUW‑78714的库存数量是多少，属于什么分类","golden_answer":"SKU RUW‑78714库存4470，属于Sports分类。","source_file":"pdf‑sample‑with‑table.pdf","expected_keywords":["RUW‑78714","4470","Sports"]}
+{"question":"Toys分类下库存最大的SKU是哪一个，库存数值是多少","golden_answer":"Toys分类库存最大SKU为AJZ‑13106，库存4101。","source_file":"pdf‑sample‑with‑table.pdf","expected_keywords":["Toys","AJZ‑13106","4101"]}
+{"question":"Home & Garden分类有哪几个商品，各自库存是多少","golden_answer":"Home & Garden有两个商品，BHG‑24667库存228，EHX‑15357库存90。","source_file":"pdf‑sample‑with‑table.pdf","expected_keywords":["Home & Garden","BHG‑24667","228","EHX‑15357","90"]}
+{"question":"North America地区Q1的营收是多少","golden_answer":"North America地区Q1 Revenue为$425,719。","source_file":"pdf‑sample‑landscape.pdf","expected_keywords":["North America","Q1 Revenue","$425,719"]}
+{"question":"状态为On Track的地区有哪两个","golden_answer":"状态为On Track的地区是Latin America和Scandinavia。","source_file":"pdf‑sample‑landscape.pdf","expected_keywords":["On Track","Latin America","Scandinavia"]}
+{"question":"Scandinavia地区总营收和增长率分别是多少","golden_answer":"Scandinavia总营收$2,789,754，Growth %为+19.4%。","source_file":"pdf‑sample‑landscape.pdf","expected_keywords":["Scandinavia","Total","$2,789,754","Growth %","+19.4%"]}
+{"question":"增长率‑5%对应的是哪个地区","golden_answer":"增长率‑5%对应的地区是Middle East。","source_file":"pdf‑sample‑landscape.pdf","expected_keywords":["‑5%","Middle East"]}
+{"question":"Asia Pacific地区Q4营收以及Target目标值是多少","golden_answer":"Asia Pacific Q4 Revenue为$880,344，Target为$3,902,712。","source_file":"pdf‑sample‑landscape.pdf","expected_keywords":["Asia Pacific","Q4 Revenue","$880,344","Target","$3,902,712"]}
+{"question":"Europe地区的业务状态Status是什么","golden_answer":"Europe地区Status为Behind。","source_file":"pdf‑sample‑landscape.pdf","expected_keywords":["Europe","Status","Behind"]}
+{"question":"Latin America地区Q2营收是多少","golden_answer":"Latin America Q2 Revenue为$517,358。","source_file":"pdf‑sample‑landscape.pdf","expected_keywords":["Latin America","Q2 Revenue","$517,358"]}
+{"question":"Africa地区总营收Total是多少","golden_answer":"Africa地区Total总营收为$2,543,522。","source_file":"pdf‑sample‑landscape.pdf","expected_keywords":["Africa","Total","$2,543,522"]}
+{"question":"‑2.4%增长率属于哪个地区，该地区Q3营收是多少","golden_answer":"‑2.4%增长率对应Oceania地区，Oceania Q3 Revenue为$516,230。","source_file":"pdf‑sample‑landscape.pdf","expected_keywords":["‑2.4%","Oceania","Q3 Revenue","$516,230"]}
+{"question":"UK & Ireland地区Q3和Q4营收分别为多少","golden_answer":"UK & Ireland Q3 Revenue $590,473，Q4 Revenue $593,587。","source_file":"pdf‑sample‑landscape.pdf","expected_keywords":["UK & Ireland","Q3 Revenue","$590,473","Q4 Revenue","$593,587"]}
+{"question":"Engineering部门的Headcount以及ROI是多少","golden_answer":"Engineering部门Headcount为110，ROI为+232.3%。","source_file":"pdf‑sample‑a3.pdf","expected_keywords":["Engineering","Headcount","110","ROI","+232.3%"]}
+{"question":"ROI为‑36.8%对应的是哪个部门","golden_answer":"ROI为‑36.8%对应的部门是Research。","source_file":"pdf‑sample‑a3.pdf","expected_keywords":["‑36.8%","Research","ROI"]}
+{"question":"HR部门Budget、Spent以及Remaining预算分别是多少","golden_answer":"HR部门Budget为$1,701,354，Spent为$1,650,313，Remaining为$51,041。","source_file":"pdf‑sample‑a3.pdf","expected_keywords":["HR","Budget","$1,701,354","Spent","$1,650,313","Remaining","$51,041"]}
+{"question":"Quality Assurance部门的On‑Time Delivery %是多少","golden_answer":"Quality Assurance部门On‑Time Delivery %为97.5%。","source_file":"pdf‑sample‑a3.pdf","expected_keywords":["Quality Assurance","On‑Time Delivery %","97.5%"]}
+{"question":"Product部门的Satisfaction Score和Projects Completed数量是多少","golden_answer":"Product部门Satisfaction Score为4.9/5.0，Projects Completed为49。","source_file":"pdf‑sample‑a3.pdf","expected_keywords":["Product","Satisfaction Score","4.9/5.0","Projects Completed","49"]}
+{"question":"Sales部门产生的Revenue Generated是多少","golden_answer":"Sales部门Revenue Generated为$4,688,510。","source_file":"pdf‑sample‑a3.pdf","expected_keywords":["Sales","Revenue Generated","$4,688,510"]}
+{"question":"Satisfaction Score为4.8/5.0的是哪个部门，该部门Headcount是多少","golden_answer":"Satisfaction Score为4.8/5.0的部门是Operations，Headcount为164。","source_file":"pdf‑sample‑a3.pdf","expected_keywords":["Operations","Satisfaction Score","4.8/5.0","Headcount","164"]}
+{"question":"Legal部门剩余Remaining预算是多少","golden_answer":"Legal部门Remaining预算为$791,354。","source_file":"pdf‑sample‑a3.pdf","expected_keywords":["Legal","Remaining","$791,354"]}
+{"question":"Design部门完成的Projects Completed数量以及按时交付率是多少","golden_answer":"Design部门Projects Completed为35，On‑Time Delivery %为86.3%。","source_file":"pdf‑sample‑a3.pdf","expected_keywords":["Design","Projects Completed","35","On‑Time Delivery %","86.3%"]}
+{"question":"Support部门的ROI数值是多少","golden_answer":"Support部门ROI为+709.6%。","source_file":"pdf‑sample‑a3.pdf","expected_keywords":["Support","ROI","+709.6%"]}
+{"question":"Background Research章节从第几页开始？","golden_answer":"Background Research章节从第3页开始。","source_file":"pdf‑sample‑50‑pages.pdf","expected_keywords":["Background Research","Page 3"]}
+{"question":"Appendix包含哪几个子附录，分别对应哪些页码？","golden_answer":"包含Appendix A（41页）、Appendix B（43页）、Appendix C（45页）。","source_file":"pdf‑sample‑50‑pages.pdf","expected_keywords":["Appendix A","Appendix B","Appendix C","41","43","45"]}
+{"question":"Summary摘要章节在哪一页？","golden_answer":"Summary章节位于文档第39页。","source_file":"pdf‑sample‑50‑pages.pdf","expected_keywords":["Summary","Page 39"]}
+{"question":"References参考文献章节从第几页开始？Index索引是哪一页？","golden_answer":"References参考文献从47页开始，Index索引在49页。","source_file":"pdf‑sample‑50‑pages.pdf","expected_keywords":["References","Index","47","49"]}
+{"question":"Data Collection数据收集章节的起始页码是多少？","golden_answer":"Data Collection章节从第9页开始。","source_file":"pdf‑sample‑50‑pages.pdf","expected_keywords":["Data Collection","Page 9"]}
+{"question":"Statistical Results统计结果章节在文档的哪一页？","golden_answer":"Statistical Results章节位于第17页。","source_file":"pdf‑sample‑50‑pages.pdf","expected_keywords":["Statistical Results","Page 17"]}
+{"question":"Future Work未来工作章节的页码是多少？","golden_answer":"Future Work章节位于第31页。","source_file":"pdf‑sample‑50‑pages.pdf","expected_keywords":["Future Work","Page 31"]}
+{"question":"Docker Compose如何配置容器健康检查的重试间隔？","golden_answer":"知识库中没有该内容，无法回答","source_file":"not_exist_doc.md","expected_keywords":["健康检查","重试间隔"],"category":"no_knowledge"}
+{"question":"LangGraph中MemorySaver的持久化存储支持哪些数据库后端？","golden_answer":"本知识库未收录LangGraph MemorySaver相关内容","source_file":"langgraph_advance.md","expected_keywords":["MemorySaver","持久化","数据库后端"],"category":"no_knowledge"}
+{"question":"悍高三段力铰链最大柜门承重是多少公斤？","golden_answer":"悍高三段力铰链单只最大承重25kg","source_file":"cabinet_hardware.md","expected_keywords":["悍高","三段力铰链","25kg"],"category":"retrieve_fail"}
+{"question":"Text2SQL项目中如何处理大表字段过多的问题？","golden_answer":"通过字段过滤、表元信息裁剪，只把业务相关字段送入向量库","source_file":"text2sql_design.md","expected_keywords":["字段过滤","元信息裁剪","向量库"],"category":"partial_answer"}

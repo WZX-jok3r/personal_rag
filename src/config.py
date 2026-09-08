@@ -19,7 +19,7 @@ BASE_DIR = Path(__file__).parent.parent  # src/ 的上一级
 
 KNOWLEDGE_BASE_DIR = BASE_DIR / "knowledge_base"
 PROCESSED_CACHE_FILE = BASE_DIR / "processed_cache" / "cache.json"
-TEST_DATASET_FILE = BASE_DIR / "test_dataset" / "qa_test.json"
+TEST_DATASET_FILE = BASE_DIR / "test_dataset" / "qa_test.jsonl"
 
 # 确保缓存目录存在
 PROCESSED_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)

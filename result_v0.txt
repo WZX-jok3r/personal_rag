@@ -1,0 +1,55 @@
+============================================================
+📊 RAG 评测报告
+============================================================
+总问题数: 73
+通过: 25 | 失败: 48
+通过率: 34.25%
+Recall@K 命中率: 43.84% (K=5)
+平均关键词命中率: 79.61%
+============================================================
+
+📁 按来源文件统计:
+  contract_snippet.md: 通过 1/1 (Recall命中 1/1)
+  cost_data.xlsx: 通过 6/6 (Recall命中 6/6)
+  docx-sample-with-images.docx: 通过 0/3 (Recall命中 3/3)
+  docx-sample-with-table.docx: 通过 2/5 (Recall命中 5/5)
+  faq.docx: 通过 4/4 (Recall命中 4/4)
+  product_spec.txt: 通过 7/7 (Recall命中 7/7)
+  tech_maunal.md: 通过 5/6 (Recall命中 6/6)
+  pdf‑sample‑with‑table.pdf: 通过 0/10 (Recall命中 0/10)
+  pdf‑sample‑landscape.pdf: 通过 0/10 (Recall命中 0/10)
+  pdf‑sample‑a3.pdf: 通过 0/10 (Recall命中 0/10)
+  pdf‑sample‑50‑pages.pdf: 通过 0/7 (Recall命中 0/7)
+  not_exist_doc.md: 通过 0/1 (Recall命中 0/1)
+  langgraph_advance.md: 通过 0/1 (Recall命中 0/1)
+  cabinet_hardware.md: 通过 0/1 (Recall命中 0/1)
+  text2sql_design.md: 通过 0/1 (Recall命中 0/1)
+
+📂 按类别统计:
+  未分类: 通过 25/69, 平均关键词命中率 80.85%
+  no_knowledge: 通过 0/2, 平均关键词命中率 100.00%
+  retrieve_fail: 通过 0/1, 平均关键词命中率 33.33%
+  partial_answer: 通过 0/1, 平均关键词命中率 0.00%
+
+❌ 失败案例:
+  1. [docx-sample-with-images.docx] docx‑sample‑with‑images.docx这份文档的标题是什么？...
+     Recall@K=True, KeywordHit=0.0%
+     回答: 根据现有资料无法回答。参考资料中虽然提到了“docx-sample-with-images.docx”这个文件名，但提供的引用内容（参考3）只包含了文档正文的“Introduction”段落，并未提及...
+  2. [docx-sample-with-images.docx] docx‑sample‑with‑images.docx里面包含哪两个大章节？...
+     Recall@K=True, KeywordHit=33.3%
+     回答: 根据现有资料无法回答。参考资料中只有【参考2】提到了docx‑sample‑with‑images.docx的内容，但其中只显示了一个“Introduction”部分，没有提供关于文档其他章节或整体结...
+  3. [docx-sample-with-images.docx] docx‑sample‑with‑images.docx文档中嵌入图片上写了什么文字？...
+     Recall@K=True, KeywordHit=0.0%
+     回答: 根据现有资料无法回答该问题。参考资料中虽然提到了"docx-sample-with-images.docx"文档，但提供的参考内容仅包含文本段落，没有描述或提及文档中嵌入图片的具体内容或文字信息。...
+  4. [docx-sample-with-table.docx] docx‑sample‑with‑table.docx文档里面表格的标题是什么？...
+     Recall@K=True, KeywordHit=50.0%
+     回答: 根据提供的参考资料，【参考1】明确指出docx-sample-with-table.docx文档中的表格标题为“Employee Directory”。...
+  5. [docx-sample-with-table.docx] docx‑sample‑with‑table.docx中Jettie Little属于哪个部门，薪资是多少？...
+     Recall@K=True, KeywordHit=50.0%
+     回答: 根据参考资料，Jettie Little 属于 **HR 部门**，薪资为 **$124,328**。
+
+**依据**：
+- 在【参考1】的员工信息表中，Jettie Little 对应的 “Depa...
+
+============================================================
+2026-09-08 14:41:40,475 - INFO - [Eval] 详细结果已保存: result_v0.json

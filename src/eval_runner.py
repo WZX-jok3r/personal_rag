@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # 评测输出统一目录
-OUTPUT_EVAL_DIR = Path("output/eval")
+OUTPUT_EVAL_DIR = Path("output")
 
 
 def dump_text_report(report: Dict[str, Any], txt_path: Path):
@@ -114,9 +114,22 @@ class EvalRunner:
         actual_answer = result["answer"]
         sources = result["sources"]
 
-        # 1. 计算 Recall@K: 期望来源是否在前 K 个结果的 source 中
+        # 添加字符标准化函数
+        def normalize_source_name(source_str):
+            """标准化source名称，将各种破折号替换为标准短横线"""
+            if not source_str:
+                return source_str
+            return source_str.replace("‑", "-").replace("–", "-").replace("—", "-")
+
+            # 1. 计算 Recall@K
+
         retrieved_sources = [s["source"] for s in sources]
-        recall_at_k = expected_source in retrieved_sources if expected_source else None
+
+        # 标准化source名称
+        normalized_retrieved_sources = [normalize_source_name(src) for src in retrieved_sources]
+        normalized_expected_source = normalize_source_name(expected_source) if expected_source else None
+
+        recall_at_k = normalized_expected_source in normalized_retrieved_sources if normalized_expected_source else None
 
         # 2. 计算 Source Rank: 期望来源在结果中的排名（1‑based，未找到为 -1）
         source_rank = -1

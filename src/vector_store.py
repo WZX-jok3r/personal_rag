@@ -8,6 +8,7 @@ vector_store.py - Qdrant 向量库连接、写入、检索、混合检索逻辑
 4. 写入向量（带 metadata）
 5. 检索向量（相似度搜索）
 6. 支持增量更新（通过 processed_cache 判断）
+7. 支持按 metadata 删除向量（用于文件更新时清理旧版本）
 """
 
 import json
@@ -131,6 +132,48 @@ class VectorStore:
         logger.warning(f"[Qdrant] 删除 collection: {self.collection_name}")
         self.client.delete_collection(collection_name=self.collection_name)
 
+    def delete_by_metadata(self, filter_dict: Dict[str, Any]) -> int:
+        """
+        根据 metadata 字段精确匹配删除向量
+        用于增量更新时清理同一文件的旧版本向量
+
+        Args:
+            filter_dict: 要匹配的 metadata 键值对，如 {"source": "contract_snippet.md"}
+
+        Returns:
+            1 表示删除请求已成功提交，0 表示无匹配条件未执行删除
+            注意: Qdrant delete API 不返回实际删除数量，仅返回操作确认
+        """
+        if not filter_dict:
+            return 0
+
+        # 构建 must 条件列表（所有条件都要满足）
+        must_conditions = [
+            FieldCondition(
+                key=key,
+                match=MatchValue(value=value)
+            )
+            for key, value in filter_dict.items()
+        ]
+
+        try:
+            result = self.client.delete(
+                collection_name=self.collection_name,
+                points_selector=Filter(must=must_conditions),
+                wait=True,  # 同步等待删除完成，保证后续 upsert 不会与删除并发冲突
+            )
+            # UpdateResult 只有 status 和 operation_id，没有 points_count
+            # status == "completed" 即表示删除操作已成功执行
+            if result.status == "completed":
+                logger.info(f"[VectorStore] 按 metadata 删除请求已执行: {filter_dict}")
+                return 1
+            else:
+                logger.warning(f"[VectorStore] 删除操作未完成，status={result.status}")
+                return 0
+        except Exception as e:
+            logger.error(f"[VectorStore] delete_by_metadata 失败: {e}")
+            raise
+
     def upsert_chunks(self, chunks: List[Dict[str, Any]], batch_size: int = 50) -> int:
         """
         将 chunks 写入 Qdrant
@@ -251,6 +294,11 @@ if __name__ == "__main__":
     ]
     vs.upsert_chunks(test_chunks)
     print(f"写入后向量数: {vs.count()}")
+
+    # 测试按 metadata 删除
+    deleted = vs.delete_by_metadata({"source": "test.txt"})
+    print(f"删除 test.txt 相关向量: {deleted} 个")
+    print(f"删除后向量数: {vs.count()}")
 
     # 测试检索
     results = vs.search("路由器质保多久")

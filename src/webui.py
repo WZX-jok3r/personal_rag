@@ -72,33 +72,31 @@ def single_query(query: str, top_k: int) -> Tuple[str, str]:
         return f"抱歉，处理出错: {str(e)}", ""
 
 
-def chat_query(message: str, history: List[Tuple[str, str]], top_k: int) -> Tuple[str, List[Tuple[str, str]]]:
+def chat_query(message: str, history: List[Dict], top_k: int) -> Tuple[str, List[Dict]]:
     """
-    多轮对话问答
-    history: Gradio 格式的 [(user_msg, bot_msg), ...]
-    Returns: (bot_response, updated_history)
+    多轮对话问答，适配 Gradio6 messages格式
+    history: [{"role":"user","content":"xxx"}, {"role":"assistant","content":"xxx"},...]
+    Returns: ("", updated_history)
     """
     if not message or not message.strip():
         return "", history
 
     try:
         pipeline = get_global_pipeline()
+        # history 本身就是 role/content 字典数组，直接传给pipeline，无需循环组装
+        result = pipeline.query_with_history(message, history, top_k=int(top_k))
 
-        # 转换 history 为 pipeline 需要的格式
-        messages = []
-        for user_msg, bot_msg in history:
-            messages.append({"role": "user", "content": user_msg})
-            messages.append({"role": "assistant", "content": bot_msg})
-
-        # 调用带历史的查询
-        result = pipeline.query_with_history(message, messages, top_k=int(top_k))
-
-        return result["answer"], history + [[message, result["answer"]]]
+        # 追加用户消息 + 助手回复
+        history.append({"role": "user", "content": message})
+        history.append({"role": "assistant", "content": result["answer"]})
+        return "", history
 
     except Exception as e:
         logger.error(f"[WebUI] 对话查询出错: {e}")
         error_msg = f"抱歉，处理出错: {str(e)}"
-        return error_msg, history + [[message, error_msg]]
+        history.append({"role": "user", "content": message})
+        history.append({"role": "assistant", "content": error_msg})
+        return "", history
 
 
 def build_ui() -> gr.Blocks:
@@ -148,6 +146,8 @@ def build_ui() -> gr.Blocks:
                     minimum=1, maximum=20, value=5, step=1,
                     label="召回数量 (Top-K)",
                 )
+            # 新增state：保存干净对话历史，仅用于传给LLM（不带参考资料）
+            clean_history_state = gr.State([])
             chatbot = gr.Chatbot(
                 label="对话历史",
                 height=500,
@@ -159,19 +159,55 @@ def build_ui() -> gr.Blocks:
                     scale=8,
                 )
                 send_btn = gr.Button("发送", variant="primary", scale=1)
+
+            def chat_query(message: str, clean_history: List[Dict], top_k: int):
+                if not message or not message.strip():
+                    return "", clean_history, clean_history
+
+                try:
+                    pipeline = get_global_pipeline()
+                    # ✅ 传给LLM的是干净历史，里面没有任何参考资料！
+                    result = pipeline.query_with_history(message, clean_history, top_k=int(top_k))
+                    answer = result["answer"]
+                    sources_md = format_sources(result["sources"])
+                    full_reply = f"{answer}\n\n---\n📚 参考资料\n{sources_md}"
+
+                    # 更新干净历史：只追加纯问答，不拼接参考
+                    new_clean_history = clean_history.copy()
+                    new_clean_history.append({"role": "user", "content": message})
+                    new_clean_history.append({"role": "assistant", "content": answer})
+
+                    # 前端展示用的对话（带参考资料）
+                    display_history = new_clean_history.copy()
+                    display_history[-1]["content"] = full_reply
+
+                    return "", new_clean_history, display_history
+                except Exception as e:
+                    logger.error(f"[WebUI] 对话查询出错: {e}")
+                    error_msg = f"抱歉，处理出错: {str(e)}"
+                    new_clean_history = clean_history.copy()
+                    new_clean_history.append({"role": "user", "content": message})
+                    new_clean_history.append({"role": "assistant", "content": error_msg})
+                    display_history = new_clean_history.copy()
+                    return "", new_clean_history, display_history
+
             send_btn.click(
                 fn=chat_query,
-                inputs=[msg_input, chatbot, top_k_chat],
-                outputs=[msg_input, chatbot],
+                inputs=[msg_input, clean_history_state, top_k_chat],
+                outputs=[msg_input, clean_history_state, chatbot],
             )
             msg_input.submit(
                 fn=chat_query,
-                inputs=[msg_input, chatbot, top_k_chat],
-                outputs=[msg_input, chatbot],
+                inputs=[msg_input, clean_history_state, top_k_chat],
+                outputs=[msg_input, clean_history_state, chatbot],
             )
+
+            def clear_conversation():
+                return "", [], []
+
             gr.Button("🗑️ 清空对话").click(
-                fn=lambda: (None, []),
-                outputs=[msg_input, chatbot],
+                fn=clear_conversation,
+                outputs=[msg_input, clean_history_state, chatbot],
             )
 
         with gr.Tab("ℹ️ 系统信息"):

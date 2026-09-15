@@ -465,16 +465,52 @@ def chunk_txt(text: str, metadata: Dict[str, Any], chunk_size: int = DEFAULT_CHU
 
 def chunk_docx(documents: List[Dict[str, Any]], chunk_size: int = DEFAULT_CHUNK_SIZE,
                overlap: int = DEFAULT_CHUNK_OVERLAP) -> List[Chunk]:
-    """DOCX 分块策略：表格整表保留"""
+    """
+    DOCX 分块策略（v3 优化）：
+    - 表格：标准 Markdown 表格 ≤ chunk_size → 整表保留；
+            超长表格 → 复用 split_markdown_table 按行切分，每个子块自带表头
+             （与 PDF md 表格策略对齐，保证行列语义完整）
+    - 段落：按段落保留，超长段递归切分
+    """
     logger.info(f"[DOCX] 分块: {documents[0]['metadata'].get('source', 'unknown') if documents else 'unknown'}")
     chunks = []
     for doc in documents:
         text = doc["text"]
         meta = doc["metadata"]
         doc_type = meta.get("type", "paragraph")
-        if doc_type == "table":
-            chunks.append(
-                Chunk(text=text, metadata={**meta, "chunk_index": len(chunks), "strategy": "docx_table_whole"}))
+        if doc_type == "image":
+            # 图片独立 chunk：OCR 文本整体保留，不按段落切分
+            # （避免 OCR 文本被误切成半句话，且图片内容应作为单一语义单元）
+            chunks.append(Chunk(
+                text=text,
+                metadata={
+                    **meta,
+                    "chunk_index": len(chunks),
+                    "strategy": "docx_image_whole",
+                    "is_image": True,
+                    "has_ocr": meta.get("has_ocr", False),
+                }
+            ))
+        elif doc_type == "table":
+            if is_markdown_table(text) and len(text) > chunk_size:
+                # 超长表格：按行切分，每子块前补表头（复用 md 表格切分逻辑）
+                sub_tables = split_markdown_table(text, max_rows_per_chunk=15)
+                for j, sub in enumerate(sub_tables):
+                    chunks.append(Chunk(
+                        text=sub,
+                        metadata={
+                            **meta,
+                            "chunk_index": len(chunks),
+                            "sub_index": j,
+                            "strategy": "docx_table_row_split",
+                            "is_table": True,
+                            "total_sub_chunks": len(sub_tables),
+                        }
+                    ))
+            else:
+                # 小表格或非标准表格：整表保留
+                chunks.append(
+                    Chunk(text=text, metadata={**meta, "chunk_index": len(chunks), "strategy": "docx_table_whole", "is_table": True}))
         else:
             paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
             for para in paragraphs:

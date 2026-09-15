@@ -1,0 +1,67 @@
+============================================================
+📊 RAG 评测报告
+============================================================
+总问题数: 72
+通过: 67 | 失败: 5
+通过率: 93.06%
+Recall@K 命中率: 95.83% (K=5)
+平均关键词命中率: 86.53%
+============================================================
+
+📁 按来源文件统计:
+  contract_snippet.md: 通过 1/1 (Recall命中 1/1)
+  cost_data.xlsx: 通过 5/6 (Recall命中 6/6)
+  docx-sample-with-images.docx: 通过 1/3 (Recall命中 3/3)
+  docx-sample-with-table.docx: 通过 4/5 (Recall命中 5/5)
+  faq.docx: 通过 4/4 (Recall命中 4/4)
+  product_spec.txt: 通过 7/7 (Recall命中 7/7)
+  tech_maunal.md: 通过 6/6 (Recall命中 6/6)
+  pdf‑sample‑with‑table.pdf: 通过 9/10 (Recall命中 10/10)
+  pdf‑sample‑landscape.pdf: 通过 10/10 (Recall命中 10/10)
+  pdf‑sample‑a3.pdf: 通过 10/10 (Recall命中 10/10)
+  pdf‑sample‑50‑pages.pdf: 通过 7/7 (Recall命中 7/7)
+  not_exist_doc.md: 通过 3/3 (Recall命中 0/3)
+
+📂 按类别统计:
+  未分类: 通过 64/69, 平均关键词命中率 85.94%
+  no_knowledge: 通过 3/3, 平均关键词命中率 100.00%
+
+❌ 失败案例:
+  1. [cost_data.xlsx] PET肤感门板的单价是多少？...
+     Recall@K=True, KeywordHit=40.0%
+     回答: 根据提供的参考资料，PET肤感门板的单价是 **210元**。
+
+**信息来源**：参考1（cost_data.xlsx）中的表格明确列出了“PET肤感门板”的单价为210元。...
+
+  2. [docx-sample-with-images.docx] docx‑sample‑with‑images.docx里面包含哪两个大章节？...
+     Recall@K=True, KeywordHit=33.3%
+     回答: 根据提供的参考资料，**docx‑sample‑with‑images.docx 文档中包含以下两个大章节：**
+
+1.  **一个图片章节**（参考2）：来源信息显示为“DOCX图片0”，表明文档中包含嵌入的图像内容。
+2.  **一个文本章节**（参考3）：标题为“Document with E...
+
+  3. [docx-sample-with-images.docx] docx‑sample‑with‑images.docx文档中嵌入图片上写了什么文字？...
+     Recall@K=True, KeywordHit=0.0%
+     回答: 根据提供的参考资料，我无法回答这个问题。  
+
+原因如下：  
+- 参考1明确指出，DOCX文档中的图片未能识别出文字内容。  
+- 其他参考资料均未提及该图片或提供其文字信息。  
+
+因此，根据现有资料，无法确定该嵌入图片上的文字内容。...
+
+  4. [docx-sample-with-table.docx] docx‑sample‑with‑table.docx中薪资最高的员工是哪一位？...
+     Recall@K=True, KeywordHit=25.0%
+     回答: 根据docx‑sample‑with‑table.docx中的员工信息表，薪资最高的员工是 **Prof. Alphonso Littel**，其薪资为 **$144,807**。
+
+**信息来源**：该信息直接来源于参考资料【参考1】中的表格数据。...
+
+  5. [pdf‑sample‑with‑table.pdf] Toys分类下库存最大的SKU是哪一个，库存数值是多少...
+     Recall@K=True, KeywordHit=33.3%
+     回答: 根据提供的参考资料，**Toys分类下库存最大的SKU是 DAS-88962，库存数值为 3434**。
+
+**信息来源与说明：**
+- 此结论基于【参考4】和【参考5】中的表格数据。这两个参考片段来自同一PDF文档的同一页，内容连贯，共同构成了一个完整的产品列表。
+- 从该列表中筛选出 `Cate...
+
+============================================================

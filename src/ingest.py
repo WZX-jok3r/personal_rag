@@ -32,7 +32,7 @@ from document_loader import (
     scan_knowledge_base,
     Document,
 )
-from chunk_strategybak import chunk_document, Chunk, chunks_to_json
+from chunk_strategy import chunk_document, Chunk, chunks_to_json
 from vector_store import get_vector_store, VectorStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")

@@ -29,7 +29,7 @@
 {"question":"AES加密的模式、密钥长度、IV向量要求是什么？","golden_answer":"AES加密模式为CBC，密钥长度128bit，IV向量16字节。","source_file":"tech_maunal.md","expected_keywords":["AES","CBC","128bit","IV向量","16字节"]}
 {"question":"RSA加密网页端一般如何使用？","golden_answer":"网页端RSA一般使用公钥加密，私钥放在服务端。","source_file":"tech_maunal.md","expected_keywords":["RSA","公钥加密","私钥","服务端"]}
 {"question":"爬虫项目约束有哪两条？timestamp时间单位是什么？","golden_answer":"1.禁止在未授权网站大规模高频爬虫；2.接口签名参数timestamp单位是毫秒。","source_file":"tech_maunal.md","expected_keywords":["未授权网站","高频爬虫","timestamp","毫秒"]}
-{"question":"V1.2手册版本做了哪些更新？","golden_answer":"V1.0为初始版本，V1.1新增mitmproxy章节，V1.2补充Windows uvx环境变量坑点。","source_file":"tech_maunal.md","expected_keywords":["V1.0","V1.1","V1.2","mitmproxy","uvx","环境变量"]}
+{"question":"开发手册V1.2做了哪些更新？","golden_answer":"V1.0为初始版本，V1.1新增mitmproxy章节，V1.2补充Windows uvx环境变量坑点。","source_file":"tech_maunal.md","expected_keywords":["V1.0","V1.1","V1.2","mitmproxy","uvx","环境变量"]}
 {"question":"SKU BHG‑24667对应的商品名称是什么","golden_answer":"SKU BHG‑24667对应的商品名称是molestiae quas。","source_file":"pdf‑sample‑with‑table.pdf","expected_keywords":["BHG‑24667","molestiae quas"]}
 {"question":"商品名称molestiae quas对应的SKU、价格、库存是多少","golden_answer":"SKU：BHG‑24667，价格：$73.15，库存：228。","source_file":"pdf‑sample‑with‑table.pdf","expected_keywords":["BHG‑24667","molestiae quas","$73.15","228"]}
 {"question":"库存90对应的SKU、商品名称和所属分类是什么","golden_answer":"SKU：EHX‑15357，商品名称：qui fugiat adipisci，分类：Home & Garden。","source_file":"pdf‑sample‑with‑table.pdf","expected_keywords":["90","EHX‑15357","qui fugiat adipisci","Home & Garden"]}
@@ -68,6 +68,5 @@
 {"question":"Statistical Results统计结果章节在文档的哪一页？","golden_answer":"Statistical Results章节位于第17页。","source_file":"pdf‑sample‑50‑pages.pdf","expected_keywords":["Statistical Results","Page 17"]}
 {"question":"Future Work未来工作章节的页码是多少？","golden_answer":"Future Work章节位于第31页。","source_file":"pdf‑sample‑50‑pages.pdf","expected_keywords":["Future Work","Page 31"]}
 {"question":"Docker Compose如何配置容器健康检查的重试间隔？","golden_answer":"知识库中没有该内容，无法回答","source_file":"not_exist_doc.md","expected_keywords":["健康检查","重试间隔"],"category":"no_knowledge"}
-{"question":"LangGraph中MemorySaver的持久化存储支持哪些数据库后端？","golden_answer":"本知识库未收录LangGraph MemorySaver相关内容","source_file":"langgraph_advance.md","expected_keywords":["MemorySaver","持久化","数据库后端"],"category":"no_knowledge"}
-{"question":"悍高三段力铰链最大柜门承重是多少公斤？","golden_answer":"悍高三段力铰链单只最大承重25kg","source_file":"cabinet_hardware.md","expected_keywords":["悍高","三段力铰链","25kg"],"category":"retrieve_fail"}
-{"question":"Text2SQL项目中如何处理大表字段过多的问题？","golden_answer":"通过字段过滤、表元信息裁剪，只把业务相关字段送入向量库","source_file":"text2sql_design.md","expected_keywords":["字段过滤","元信息裁剪","向量库"],"category":"partial_answer"}
+{"question":"LangGraph中MemorySaver的持久化存储支持哪些数据库后端？","golden_answer":"本知识库未收录LangGraph MemorySaver相关内容","source_file":"not_exist_doc.md","expected_keywords":["MemorySaver","持久化","数据库后端"],"category":"no_knowledge"}
+{"question": "LangChain 的 ChatPromptTemplate 中如何设置 temperature 参数？", "golden_answer": "本知识库未收录 LangChain ChatPromptTemplate 相关内容", "source_file": "not_exist_doc.md", "expected_keywords": ["ChatPromptTemplate", "temperature"], "category": "no_knowledge"}

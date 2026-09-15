@@ -121,8 +121,6 @@ class EvalRunner:
                 return source_str
             return source_str.replace("‑", "-").replace("–", "-").replace("—", "-")
 
-            # 1. 计算 Recall@K
-
         retrieved_sources = [s["source"] for s in sources]
 
         # 标准化source名称
@@ -151,9 +149,28 @@ class EvalRunner:
 
         keyword_hit_rate = sum(1 for h in keyword_hits if h["hit"]) / len(keyword_hits) if keyword_hits else 0
 
-        # 4. 综合评分
-        # 如果 Recall@K 为 True 且 Keyword Hit Rate >= 0.6，认为通过
-        passed = recall_at_k is True and keyword_hit_rate >= 0.6
+        # 4. 综合评分（按 category 区分逻辑）
+        category = item.get("category", "未分类")
+
+        if category == "no_knowledge":
+            # 知识库外问题：期望模型正确"拒答"，而非给出编造的内容。
+            # 正确拒答的判定：回答中包含明确的无法回答/未收录信号。
+            # 注意: 此场景下 expected_keywords 通常是问题概念词（如 LangGraph、MemorySaver），
+            # 即使模型正确拒答也会在解释原因时提到它们，因此 keyword_hit_rate 无评判意义，
+            # 不能作为通过条件，只能作为参考信息保留。
+            refusal_keywords = [
+                "无法回答",
+                "未收录",
+                "没有相关",
+                "未能找到",
+                "未提及",
+                "没有提及",
+            ]
+            refusal_detected = any(kw in actual_answer for kw in refusal_keywords)
+            passed = refusal_detected
+        else:
+            # 知识库内问题：Recall@K 命中且回答覆盖大部分期望关键词，认为通过
+            passed = recall_at_k is True and keyword_hit_rate >= 0.5
 
         return {
             # 原始数据

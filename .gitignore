@@ -6,3 +6,11 @@ __pycache__/
 *.pyc 
 venv/ 
 rag_py311/ 
+
+# IDE / 本地工具
+.idea/
+
+# 运行产物 / 临时输出
+output/
+marker_out/
+_diag_qdrant.py

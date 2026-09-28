@@ -1,0 +1,90 @@
+:root {
+  --bg: #f5f6f8;
+  --fg: #1f2329;
+  --muted: #8a9099;
+  --primary: #2563eb;
+  --primary-dark: #1d4ed8;
+  --user-bubble: #2563eb;
+  --bot-bubble: #ffffff;
+  --border: #e3e6ea;
+  --danger: #dc2626;
+  --radius: 12px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.app-header {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.app-header h1 {
+  font-size: 18px;
+  margin: 0;
+}
+
+.app-sub {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.app-main {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+button {
+  cursor: pointer;
+  border: none;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 14px;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--primary);
+  color: #fff;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--primary-dark);
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+}

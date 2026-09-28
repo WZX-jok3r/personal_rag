@@ -17,14 +17,16 @@ import json
 import time
 import argparse
 import logging
+import fnmatch
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 from config import (
     KNOWLEDGE_BASE_DIR,
     PROCESSED_CACHE_FILE,
     SUPPORTED_EXTENSIONS,
     PDF_SUBDIR,
+    TENANT_FIELD,
 )
 from document_loader import (
     load_file,
@@ -98,16 +100,63 @@ def _get_rel_path(file_path: Path) -> str:
         return file_path.name
 
 
-def process_file(file_path: Path, vector_store: VectorStore) -> Dict[str, Any]:
+def _normalize_tenants(raw: Optional[List[str]]) -> Optional[List[str]]:
+    """
+    将 --tenant 入参归一为去重的租户列表。
+    支持两种写法：--tenant a,b 与 --tenant a --tenant b（可混用）。
+    返回 None 表示不启用租户隔离（不写字段）；空列表也视为 None。
+    """
+    if not raw:
+        return None
+    result: List[str] = []
+    for part in raw:
+        for token in str(part).split(","):
+            t = token.strip()
+            if t and t not in result:
+                result.append(t)
+    return result or None
+
+
+def _select_files(file_paths: List[Path], patterns: Optional[List[str]]) -> Optional[List[Path]]:
+    """
+    按 --files 传入的模式筛选文件（支持逗号分隔与多次传入）。
+    每个模式可是：文件名(product_spec.txt)、相对路径(sub/a.md)或通配符(*.md)。
+    无模式时返回 None（表示不筛选、处理全部）；有模式但无命中时返回空列表。
+    """
+    if not patterns:
+        return None
+    pats: List[str] = []
+    for part in patterns:
+        for token in str(part).split(","):
+            t = token.strip()
+            if t:
+                pats.append(t)
+    if not pats:
+        return None
+    selected: List[Path] = []
+    for fp in file_paths:
+        rel = _get_rel_path(fp)
+        name = fp.name
+        if any(fnmatch.fnmatch(name, p) or fnmatch.fnmatch(rel, p) or rel == p or name == p for p in pats):
+            selected.append(fp)
+    return selected
+
+
+def process_file(file_path: Path, vector_store: VectorStore, tenant_ids: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     处理单个文件：清理旧向量 → 解析 → 分块 → 向量化入库
     返回处理记录，用于更新 cache
+
+    tenant_ids: 多租户 ACL 列表。为空时不写入租户字段（保持旧行为）；
+    非空时把整个列表写入每个 chunk 的 tenant 字段（一份数据多方可见），
+    旧向量按 source 整体清理（一份文件=一组向量，重新入库即刷新其 ACL）。
     """
     rel_path = _get_rel_path(file_path)
     start_time = time.time()
     logger.info(f"[Process] 开始处理: {file_path.name}")
 
     # ✅ P0: 无论新增/变更/空文件，先清理该文件的所有旧向量，保证数据一致性
+    #   ACL 模型下一个文件是一份数据（一组向量），按 source 整体清理即可
     deleted = vector_store.delete_by_metadata({"source": rel_path})
     if deleted > 0:
         logger.info(f"[Ingest] 已清理 {rel_path} 的旧向量")
@@ -134,6 +183,11 @@ def process_file(file_path: Path, vector_store: VectorStore) -> Dict[str, Any]:
 
     # 4. 向量化入库（内部应支持批量 embedding + 批量 upsert）
     chunk_dicts = [chunk.to_dict() for chunk in chunks]
+    # 多租户 ACL：把租户列表整体写入每个 chunk 的 tenant 字段（为空则不写入，保持旧行为）
+    #   Qdrant keyword 字段支持多值，查询 MatchValue(单个租户) 会命中"数组包含该值"的点
+    if tenant_ids:
+        for cd in chunk_dicts:
+            cd.setdefault("metadata", {})[TENANT_FIELD] = list(tenant_ids)
     inserted = vector_store.upsert_chunks(chunk_dicts)
     logger.info(f"[Process] {file_path.name}: 已写入 {inserted} 条向量")
 
@@ -148,13 +202,16 @@ def process_file(file_path: Path, vector_store: VectorStore) -> Dict[str, Any]:
     }
 
 
-def run_ingest(force: bool = False, reset: bool = False):
+def run_ingest(force: bool = False, reset: bool = False, tenant_ids: Optional[List[str]] = None,
+               include: Optional[List[str]] = None):
     """
     执行入库流程
 
     Args:
         force: 强制重新处理所有文件（忽略缓存）
         reset: 清空 Qdrant 和缓存，重新全量入库
+        tenant_ids: 多租户 ACL 列表，写入每个 chunk 的 tenant 字段；为空则不启用隔离
+        include: --files 文件筛选模式（文件名/相对路径/通配符）；为空则处理全部
     """
     # 初始化
     cache = ProcessedCache(PROCESSED_CACHE_FILE)
@@ -181,6 +238,18 @@ def run_ingest(force: bool = False, reset: bool = False):
 
     logger.info(f"[Ingest] 扫描到 {len(file_paths)} 个文件")
 
+    # 文件筛选（--files）：只处理命中的文件，便于对不同文件打不同租户标签
+    #   指定了筛选时，选中文件一律强制重处理（改标签本就需要重灌，不受缓存跳过影响）
+    selected = _select_files(file_paths, include)
+    force_selected = False
+    if include:
+        if not selected:
+            logger.error(f"[Ingest] --files 未匹配到任何文件，请检查名称/路径/通配符: {include}")
+            return
+        force_selected = True
+        logger.info(f"[Ingest] 文件筛选命中 {len(selected)} 个（共扫描 {len(file_paths)} 个），将强制重处理这 {len(selected)} 个")
+        file_paths = selected
+
     # 统计
     stats = {
         "total_files": len(file_paths),
@@ -198,14 +267,15 @@ def run_ingest(force: bool = False, reset: bool = False):
         file_hash = compute_file_hash(fp)
 
         # 判断是否跳过（仅当缓存状态为 success 且 hash 一致时跳过）
-        if not force and cache.is_file_unchanged(rel_path, file_hash):
+        #   force_selected: 由 --files 显式选中的文件不跳过，确保重新打标签生效
+        if not force and not force_selected and cache.is_file_unchanged(rel_path, file_hash):
             logger.info(f"[Ingest] 跳过未变更文件: {fp.name}")
             stats["skipped"] += 1
             continue
 
         # 处理文件
         try:
-            record = process_file(fp, vector_store)
+            record = process_file(fp, vector_store, tenant_ids=tenant_ids)
             cache.set_file_record(rel_path, record)
             # ✅ P1: 每处理完一个文件立即保存缓存，防止中途崩溃导致重跑
             cache.save()
@@ -249,9 +319,18 @@ def main():
     parser = argparse.ArgumentParser(description="RAG 知识库增量入库脚本")
     parser.add_argument("--force", action="store_true", help="强制重新处理所有文件")
     parser.add_argument("--reset", action="store_true", help="清空 Qdrant 和缓存，重新全量入库")
+    parser.add_argument("--tenant", type=str, action="append", default=None,
+                        help="多租户 ACL（可重复或逗号分隔）：--tenant a,b 或 --tenant a --tenant b；"
+                             "写入每个 chunk 的租户列表并按包含关系隔离检索；不传则不启用租户隔离")
+    parser.add_argument("--files", type=str, action="append", default=None,
+                        help="只处理命中的文件（可重复或逗号分隔）：支持文件名、相对路径或通配符如 *.md；"
+                             "用于对不同文件选择性打不同租户。选中文件会强制重处理，其余文件与缓存不动")
     args = parser.parse_args()
 
-    run_ingest(force=args.force, reset=args.reset)
+    tenant_ids = _normalize_tenants(args.tenant)
+    if tenant_ids:
+        logger.info(f"[Ingest] 多租户 ACL 已启用，本批数据归属租户: {tenant_ids}")
+    run_ingest(force=args.force, reset=args.reset, tenant_ids=tenant_ids, include=args.files)
 
 
 if __name__ == "__main__":

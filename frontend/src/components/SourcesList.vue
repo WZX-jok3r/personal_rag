@@ -2,16 +2,18 @@
 import { ref } from "vue";
 import type { SourceItem } from "../api/types";
 
-defineProps<{ sources?: SourceItem[] }>();
+defineProps<{ sources?: SourceItem[]; hiddenCount?: number }>();
 
 // 默认折叠，点击展开查看引用片段
 const open = ref(false);
 </script>
 
 <template>
-  <div v-if="sources && sources.length" class="sources">
+  <div v-if="(sources && sources.length) || hiddenCount" class="sources">
     <button class="sources-toggle" @click="open = !open">
-      📚 参考资料 {{ sources.length }} 条 {{ open ? "▲" : "▼" }}
+      📚 参考资料 {{ sources?.length || 0 }} 条
+      <span v-if="hiddenCount" class="hidden-badge" title="被低相关过滤阈值隐藏">🙈 已隐藏 {{ hiddenCount }} 条</span>
+      {{ open ? "▲" : "▼" }}
     </button>
     <ol v-show="open" class="sources-list">
       <li v-for="(s, i) in sources" :key="i" class="source-item">
@@ -39,6 +41,17 @@ const open = ref(false);
   color: var(--muted);
   font-size: 12px;
   padding: 2px 0;
+}
+
+.hidden-badge {
+  display: inline-block;
+  background: #fef3c7;
+  color: #92400e;
+  border: 1px solid #fde68a;
+  border-radius: 9999px;
+  padding: 0 8px;
+  margin: 0 4px;
+  font-size: 11px;
 }
 
 .sources-list {

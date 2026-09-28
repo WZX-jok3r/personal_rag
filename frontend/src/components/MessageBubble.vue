@@ -8,6 +8,7 @@ const props = defineProps<{
   role: "user" | "assistant";
   content: string;
   sources?: SourceItem[];
+  hiddenCount?: number;
 }>();
 
 // html:false 禁止内联 HTML，规避 XSS；linkify 自动识别链接
@@ -25,7 +26,7 @@ const rendered = computed(() =>
     <div class="bubble">
       <div v-if="role === 'assistant'" class="md" v-html="rendered"></div>
       <div v-else class="plain">{{ content }}</div>
-      <SourcesList v-if="role === 'assistant'" :sources="sources" />
+      <SourcesList v-if="role === 'assistant'" :sources="sources" :hidden-count="hiddenCount" />
     </div>
   </div>
 </template>

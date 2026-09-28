@@ -31,6 +31,7 @@ from config import (
     TOP_K,
 )
 from vector_store import get_vector_store, VectorStore
+import observability as obs
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -72,12 +73,13 @@ class RAGPipeline:
         if not self.api_key:
             raise ValueError("SILICONFLOW_API_KEY 未配置")
 
-    def _retrieve(self, query: str, top_k: int = TOP_K, filter_dict: Optional[Dict] = None) -> List[Dict[str, Any]]:
-        """检索相关 chunk"""
+    def _retrieve(self, query: str, top_k: int = TOP_K, filter_dict: Optional[Dict] = None):
+        """检索相关 chunk。返回 (chunks, dropped)，dropped 为被低相关过滤掉的条数"""
         logger.info(f"[Retrieve] 查询: {query}")
-        results = self.vector_store.search(query, top_k=top_k, filter_dict=filter_dict)
-        logger.info(f"[Retrieve] 召回 {len(results)} 条结果")
-        return results
+        results, stats = self.vector_store.search(query, top_k=top_k, filter_dict=filter_dict, with_stats=True)
+        dropped = stats.get("dropped", 0)
+        logger.info(f"[Retrieve] 召回 {len(results)} 条结果" + (f"（已过滤低相关 {dropped} 条）" if dropped else ""))
+        return results, dropped
 
     def _build_context(self, chunks: List[Dict[str, Any]]) -> str:
         """将检索结果组装成 context 文本"""
@@ -108,37 +110,53 @@ class RAGPipeline:
         return "\n\n".join(context_parts)
 
     def _call_llm(self, system_prompt: str, user_query: str) -> str:
-        """调用 SiliconFlow DeepSeek API"""
+        """调用 SiliconFlow DeepSeek API（保持旧签名：仅返回答案文本）。
+        实际请求与 usage 捕获都委派给 _do_llm_request，作为唯一埋点入口。"""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_query},
+        ]
+        answer, _usage = self._do_llm_request(messages)
+        return answer
+
+    def _do_llm_request(self, messages: List[Dict[str, str]]) -> (str, Dict[str, Any]):
+        """
+        统一的 LLM 请求入口（query 与 query_with_history 共用）。
+        - 在一个 Langfuse generation 下发起请求，记录 input/output 与 token usage；
+          可观测未启用时 generation 为 no-op，行为与之前完全一致。
+        - 返回 (答案文本, usage 字典)；异常时返回友好提示与空 usage。
+        """
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-
         payload = {
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_query},
-            ],
+            "messages": messages,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "stream": False,
         }
 
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=120)
-            response.raise_for_status()
-            data = response.json()
-            answer = data["choices"][0]["message"]["content"]
-            return answer.strip()
+        with obs.generation("llm", model=self.model, input=messages) as gen:
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=120)
+                response.raise_for_status()
+                data = response.json()
+                answer = data["choices"][0]["message"]["content"].strip()
+                usage = obs.extract_usage(data)
+                gen.update(output=answer, usage=usage, metadata={"model": self.model})
+                return answer, usage
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"[LLM] API 请求失败: {e}")
-            return f"抱歉，调用模型时出错: {str(e)}"
-        except (KeyError, IndexError) as e:
-            logger.error(f"[LLM] 响应解析失败: {e}")
-            return "抱歉，模型响应格式异常，请稍后重试。"
+            except requests.exceptions.RequestException as e:
+                logger.error(f"[LLM] API 请求失败: {e}")
+                gen.update(output=f"抱歉，调用模型时出错: {str(e)}", level="ERROR", status_message=str(e))
+                return f"抱歉，调用模型时出错: {str(e)}", {}
+            except (KeyError, IndexError) as e:
+                logger.error(f"[LLM] 响应解析失败: {e}")
+                gen.update(output="抱歉，模型响应格式异常。", level="ERROR", status_message=str(e))
+                return "抱歉，模型响应格式异常，请稍后重试。", {}
 
     def query(self, query: str, top_k: int = TOP_K, filter_dict: Optional[Dict] = None,
               generate: bool = True) -> Dict[str, Any]:
@@ -157,43 +175,54 @@ class RAGPipeline:
             }
         """
         # 1. 检索
-        chunks = self._retrieve(query, top_k=top_k, filter_dict=filter_dict)
-        if not chunks:
-            return {
+        with obs.trace("rag_query", input={"query": query, "top_k": top_k, "generate": generate},
+                        metadata={"filter": filter_dict}) as tr:
+            with obs.span("retrieve", input=query) as sp:
+                chunks, dropped = self._retrieve(query, top_k=top_k, filter_dict=filter_dict)
+                sp.update(output={"retrieved_count": len(chunks), "hidden_count": dropped})
+            if not chunks:
+                result = {
+                    "query": query,
+                    "answer": "根据现有资料，未能找到相关信息。",
+                    "sources": [],
+                    "retrieved_count": 0,
+                    "hidden_count": dropped,
+                }
+                tr.update(output=result["answer"], metadata={"retrieved_count": 0})
+                return result
+
+            # 2~4. 组装 context + 调用 LLM（retrieval-only 模式跳过生成环节）
+            if generate:
+                context = self._build_context(chunks)
+                system_prompt = self.SYSTEM_PROMPT.format(context=context)
+                logger.info(f"[LLM] 调用 {self.model} 生成回答...")
+                answer = self._call_llm(system_prompt, query)
+            else:
+                answer = "(retrieval-only：已跳过 LLM 生成)"
+
+            # 5. 格式化 sources
+            sources = []
+            for chunk in chunks:
+                meta = chunk["metadata"]
+                from pathlib import Path
+                source_name = Path(meta.get("source", "")).name
+                sources.append({
+                    "source": source_name,
+                    "format": meta.get("format", "unknown"),
+                    "score": round(chunk["score"], 4),
+                    "text_preview": chunk["text"][:200] + "..." if len(chunk["text"]) > 200 else chunk["text"],
+                })
+
+            result = {
                 "query": query,
-                "answer": "根据现有资料，未能找到相关信息。",
-                "sources": [],
-                "retrieved_count": 0,
+                "answer": answer,
+                "sources": sources,
+                "retrieved_count": len(chunks),
+                "hidden_count": dropped,
             }
-
-        # 2~4. 组装 context + 调用 LLM（retrieval-only 模式跳过生成环节）
-        if generate:
-            context = self._build_context(chunks)
-            system_prompt = self.SYSTEM_PROMPT.format(context=context)
-            logger.info(f"[LLM] 调用 {self.model} 生成回答...")
-            answer = self._call_llm(system_prompt, query)
-        else:
-            answer = "(retrieval-only：已跳过 LLM 生成)"
-
-        # 5. 格式化 sources
-        sources = []
-        for chunk in chunks:
-            meta = chunk["metadata"]
-            from pathlib import Path
-            source_name = Path(meta.get("source", "")).name
-            sources.append({
-                "source": source_name,
-                "format": meta.get("format", "unknown"),
-                "score": round(chunk["score"], 4),
-                "text_preview": chunk["text"][:200] + "..." if len(chunk["text"]) > 200 else chunk["text"],
-            })
-
-        return {
-            "query": query,
-            "answer": answer,
-            "sources": sources,
-            "retrieved_count": len(chunks),
-        }
+            tr.update(output=answer, metadata={"retrieved_count": len(chunks),
+                                                "sources": [s["source"] for s in sources]})
+            return result
 
     def query_with_history(self, query: str, history: List[Dict[str, str]],
                            top_k: int = TOP_K, filter_dict: Optional[Dict] = None) -> Dict[str, Any]:
@@ -203,54 +232,42 @@ class RAGPipeline:
         filter_dict: 服务端强制的元数据过滤（如多租户 tenant_id 隔离）
         """
         # 1. 检索（基于当前 query，叠加服务端强制过滤）
-        chunks = self._retrieve(query, top_k=top_k, filter_dict=filter_dict)
-        context = self._build_context(chunks) if chunks else "无相关参考资料"
+        with obs.trace("rag_chat", input={"query": query, "top_k": top_k, "history_len": len(history)},
+                        metadata={"filter": filter_dict}) as tr:
+            with obs.span("retrieve", input=query) as sp:
+                chunks, dropped = self._retrieve(query, top_k=top_k, filter_dict=filter_dict)
+                sp.update(output={"retrieved_count": len(chunks), "hidden_count": dropped})
+            context = self._build_context(chunks) if chunks else "无相关参考资料"
 
-        # 2. 组装 messages
-        messages = [{"role": "system", "content": self.SYSTEM_PROMPT.format(context=context)}]
-        messages.extend(history)
-        messages.append({"role": "user", "content": query})
+            # 2. 组装 messages
+            messages = [{"role": "system", "content": self.SYSTEM_PROMPT.format(context=context)}]
+            messages.extend(history)
+            messages.append({"role": "user", "content": query})
 
-        # 3. 调用 LLM
-        url = f"{self.base_url}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            "stream": False,
-        }
+            # 3. 调用 LLM（统一入口，内部带 generation 埋点与 usage 捕获）
+            answer, _usage = self._do_llm_request(messages)
 
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=120)
-            response.raise_for_status()
-            data = response.json()
-            answer = data["choices"][0]["message"]["content"].strip()
-        except Exception as e:
-            logger.error(f"[LLM] 请求失败: {e}")
-            answer = f"抱歉，调用模型时出错: {str(e)}"
+            sources = []
+            for chunk in chunks:
+                meta = chunk["metadata"]
+                from pathlib import Path
+                source_name = Path(meta.get("source", "")).name
+                sources.append({
+                    "source": source_name,
+                    "format": meta.get("format", "unknown"),
+                    "score": round(chunk["score"], 4),
+                })
 
-        sources = []
-        for chunk in chunks:
-            meta = chunk["metadata"]
-            from pathlib import Path
-            source_name = Path(meta.get("source", "")).name
-            sources.append({
-                "source": source_name,
-                "format": meta.get("format", "unknown"),
-                "score": round(chunk["score"], 4),
-            })
-
-        return {
-            "query": query,
-            "answer": answer,
-            "sources": sources,
-            "retrieved_count": len(chunks),
-        }
+            result = {
+                "query": query,
+                "answer": answer,
+                "sources": sources,
+                "retrieved_count": len(chunks),
+                "hidden_count": dropped,
+            }
+            tr.update(output=answer, metadata={"retrieved_count": len(chunks),
+                                                "sources": [s["source"] for s in sources]})
+            return result
 
 
 # ==================== 便捷函数 ====================

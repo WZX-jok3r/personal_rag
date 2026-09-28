@@ -44,6 +44,7 @@ async function onNewSession() {
         :role="m.role"
         :content="m.content"
         :sources="m.sources"
+        :hidden-count="m.hiddenCount"
       />
       <div v-if="chat.isLoading" class="loading-row">
         <span class="dot"></span><span class="dot"></span><span class="dot"></span>

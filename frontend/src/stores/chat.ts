@@ -11,6 +11,7 @@ export interface ChatMessage {
   role: ChatRole;
   content: string;
   sources?: SourceItem[];
+  hiddenCount?: number;
 }
 
 const SESSION_KEY = "rag_session_id";
@@ -83,6 +84,7 @@ export const useChatStore = defineStore("chat", {
           role: "assistant",
           content: res.answer,
           sources: res.sources,
+          hiddenCount: res.hidden_count ?? 0,
         });
         this.status = "idle";
       } catch (e) {

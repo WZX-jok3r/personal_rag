@@ -2,8 +2,8 @@
 api.py - FastAPI 后端服务（前后端分离的"后端"）
 
 设计要点（结合本项目现状）:
-1. 复用现有 RAGPipeline，不改其核心逻辑；仅把 webui.py 里的业务逻辑
-   （来源格式化、多轮历史）下沉到后端，前端只负责渲染。
+1. 复用现有 RAGPipeline，不改其核心逻辑；仅把来源格式化、多轮历史等业务逻辑
+   下沉到后端，前端只负责渲染。
 2. pipeline 用单例（lifespan 启动时初始化一次），避免每请求重建 Qdrant 连接。
 3. 接口用同步 def：RAGPipeline 内部是阻塞的 requests 调用，交给 FastAPI 线程池
    执行即可，无需把整条链路改成 async。
@@ -61,7 +61,7 @@ _pipeline: Optional[RAGPipeline] = None
 
 
 def get_global_pipeline() -> RAGPipeline:
-    """获取全局 pipeline 实例（懒加载，语义与 webui 保持一致）"""
+    """获取全局 pipeline 实例（懒加载单例，避免每请求重建 Qdrant 连接）"""
     global _pipeline
     if _pipeline is None:
         logger.info("[API] 初始化 RAG Pipeline...")
@@ -161,6 +161,7 @@ class QueryResponse(BaseModel):
     answer: str
     sources: List[SourceItem]
     retrieved_count: int
+    hidden_count: int = Field(0, description="本次被低相关过滤掉、未展示的条数")
 
 
 class ChatResponse(BaseModel):
@@ -169,6 +170,7 @@ class ChatResponse(BaseModel):
     sources: List[SourceItem]
     retrieved_count: int
     history_length: int = Field(..., description="该会话当前保存的历史消息条数")
+    hidden_count: int = Field(0, description="本次被低相关过滤掉、未展示的条数")
 
 
 class SessionCreated(BaseModel):
@@ -292,6 +294,7 @@ def chat_query(req: ChatRequest, principal: Principal = Depends(require_principa
         sources=result["sources"],
         retrieved_count=result["retrieved_count"],
         history_length=len(_sessions.get_history(session_id)),
+        hidden_count=result.get("hidden_count", 0),
     )
 
 
@@ -317,6 +320,7 @@ _DEMO_HTML = """<!doctype html>
  .row{margin:8px 0} #log{border:1px solid #ddd;padding:12px;height:360px;overflow:auto;border-radius:8px}
  button,input[type=text]{padding:8px 12px;border-radius:8px;border:1px solid #ccc}
  input[type=text]{width:70%} .who{font-weight:600} .src{color:#666;font-size:12px;margin-left:8px}
+ .badge{display:inline-block;background:#fef3c7;color:#92400e;border:1px solid #fde68a;border-radius:9999px;padding:1px 8px;font-size:11px;margin-left:6px}
 </style></head>
 <body>
 <h2>Personal RAG · 多轮对话 Session 演示</h2>
@@ -347,7 +351,9 @@ async function send(){
   if(!r.ok){ const e=await r.json().catch(()=>({})); append('AI','⚠️ '+(e.detail||r.status)); return; }
   const j=await r.json(); sid=j.session_id; document.getElementById('sid').textContent=sid;
   const srcs=(j.sources||[]).map(s=>`[${s.source}] ${s.score}`).join(' · ');
-  append('AI', j.answer, '参考资料: '+(srcs||'无'));
+  let srcHtml='参考资料: '+(srcs||'无');
+  if(j.hidden_count>0){ srcHtml+=` <span class="badge">🙈 已隐藏 ${j.hidden_count} 条低相关</span>`; }
+  append('AI', j.answer, srcHtml);
 }
 async function newSession(){
   if(sid) await fetch('/api/sessions/'+sid,{method:'DELETE', headers:authHeaders({})});

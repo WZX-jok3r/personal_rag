@@ -14,7 +14,6 @@
 requests>=2.31.0            # rag_pipeline / vector_store 调用 SiliconFlow HTTP API
 python-dotenv>=1.0.0        # config.py 加载 .env
 qdrant-client>=1.13.0       # vector_store.py 连接 Qdrant 向量库
-gradio>=5.5.0               # webui.py 问答前端
 fastapi>=0.115.0            # api.py 前后端分离后端（REST API）
 uvicorn[standard]>=0.32.0   # api.py ASGI 服务器（python src/api.py 启动）
 
@@ -36,6 +35,7 @@ pytesseract>=0.3.10         # OCR 兜底（扫描件 PDF + DOCX 内嵌图片）�
                             #   真正执行依赖系统的 tesseract.exe，见第四节说明
 Pillow>=10.0.0              # 配合 pytesseract 做图片处理（DOCX 图片 OCR 需要）
 jieba>=0.42.1               # BM25 通道中文预分词（vector_store.tokenize_for_bm25）；未装自动降级为原文
+langfuse>=3.0.0            # 可观测（observability.py 埋点 LLM/检索链路到 Langfuse）；未装或未配密钥则整体 no-op，不影响主链路
 
 
 # ----------------------------------------------------------------------------

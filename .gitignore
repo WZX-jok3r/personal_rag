@@ -1,5 +1,4 @@
-.env 
-knowledge_base/ 
+.env
 processed_cache/ 
 qdrant_storage/ 
 __pycache__/ 

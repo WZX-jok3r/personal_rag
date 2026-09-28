@@ -21,6 +21,7 @@ export interface QueryResponse {
   answer: string;
   sources: SourceItem[];
   retrieved_count: number;
+  hidden_count?: number;
 }
 
 /** POST /api/chat 请求体 */
@@ -37,6 +38,7 @@ export interface ChatResponse {
   sources: SourceItem[];
   retrieved_count: number;
   history_length: number;
+  hidden_count?: number;
 }
 
 /** POST /api/sessions 响应 */

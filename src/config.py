@@ -70,6 +70,21 @@ RERANK_MODEL = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 # 参与精排的候选数（需 >= TOP_K，否则精排无意义）
 RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "20"))
 
+# ==================== 低相关结果过滤（仅对 rerank 绝对分生效）====================
+# 开精排时 score 是交叉编码器输出的相关度（约 [0,1]），可用绝对阈值；
+# 未开精排 / 精排降级时 score 是 RRF 融合分（量级仅 ~0.016），此时只做数量截断，
+# 绝不套用绝对阈值，否则会把全部结果误杀。
+SCORE_REL_RATIO = float(os.getenv("SCORE_REL_RATIO", "0.15"))   # 相对断层：低于最高分该比例的视为噪声
+SCORE_ABS_MIN = float(os.getenv("SCORE_ABS_MIN", "0.05"))       # 绝对下限：兼作“整体无相关”的拒答判定线
+SCORE_CONFIDENT = float(os.getenv("SCORE_CONFIDENT", "0.5"))    # 高水位：达到此分的结果无条件保留（不限量）
+SCORE_MIN_KEEP = int(os.getenv("SCORE_MIN_KEEP", "1"))          # 保底条数：即使全部低于水位也至少保留最高分 N 条
+SCORE_DROP_ALL_BELOW = os.getenv("SCORE_DROP_ALL_BELOW", "false").lower() in ("1", "true", "yes")
+# 行为（仅对 rerank 分生效，详见 vector_store._filter_low_relevance）:
+#   最高分 < SCORE_ABS_MIN         -> 整体无相关：根据 SCORE_DROP_ALL_BELOW 全丢（拒答）或仅保底 N 条
+#   最高分 >= SCORE_CONFIDENT       -> 有强锤点，启用相对断层：阈值 = max(SCORE_ABS_MIN, 最高分*SCORE_REL_RATIO)
+#   SCORE_ABS_MIN <= 最高分 < 高水位 -> 只有中等分，保守仅用绝对下限截断，不对中等分簇施断层（避免误杀）
+#   过滤后为空                       -> 保底保留最高分 SCORE_MIN_KEEP 条（SCORE_MIN_KEEP=0 等价取消保底）
+
 # ==================== 鉴权与多租户配置 ====================
 # 多租户隔离字段名：入库写入该 metadata 字段，检索时服务端按此字段强制过滤
 TENANT_FIELD = os.getenv("TENANT_FIELD", "tenant_id")
@@ -98,6 +113,16 @@ def _parse_tenant_keys(raw: str) -> Dict[str, str]:
 TENANT_KEYS = _parse_tenant_keys(os.getenv("RAG_TENANT_KEYS", ""))
 # 鉴权是否启用（配置了任意租户 Key 即启用）
 AUTH_ENABLED = bool(TENANT_KEYS)
+
+# ==================== 可观测配置（Langfuse，软依赖，默认关闭）====================
+# 仅在同时配置 public+secret 两把密钥时才启用；否则埋点全部 no-op，
+# 对主链路零影响、零网络调用。需安装 langfuse 包: pip install "langfuse>=3.0.0"
+# 云端与自托管均可：自托管把 LANGFUSE_HOST 改成自己的服务地址即可。
+LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
+LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")
+# 兼容两种变量名： LANGFUSE_HOST 或 LANGFUSE_BASE_URL（都映射到 SDK 的 host）
+LANGFUSE_HOST = os.getenv("LANGFUSE_HOST") or os.getenv("LANGFUSE_BASE_URL") or "https://cloud.langfuse.com"
+LANGFUSE_ENABLED = bool(LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY)
 
 # ==================== 支持的文件格式 ====================
 SUPPORTED_EXTENSIONS = {

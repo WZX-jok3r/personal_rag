@@ -52,8 +52,14 @@ from config import (
     RERANK_ENABLED,
     RERANK_MODEL,
     RERANK_CANDIDATES,
+    SCORE_REL_RATIO,
+    SCORE_ABS_MIN,
+    SCORE_CONFIDENT,
+    SCORE_MIN_KEEP,
+    SCORE_DROP_ALL_BELOW,
     TENANT_FIELD,
 )
+import observability as obs
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -97,6 +103,50 @@ def tokenize_for_bm25(text: str) -> str:
     return " ".join(tokens)
 
 
+def _filter_low_relevance(results: List[Dict[str, Any]], score_kind: str):
+    """
+    低相关结果过滤（对已按分数降序排列的 results 生效），返回 (kept, dropped_count)。
+
+    量纲安全（H）：
+    - score_kind == "rerank": score 是交叉编码器的绝对相关分（约 [0,1]），才启用下面的阈值。
+    - 其它（"rrf"/"vector"）：分数不具备跨 query 的绝对含义（RRF 融合分量级仅 ~0.016），
+      套用绝对阈值会把全部结果误杀，因此直接原样返回、不做过滤。
+
+    阈值策略（仅 rerank）：
+    1) SCORE_ABS_MIN <= 0 视为关闭过滤；
+    2) 最高分 < SCORE_ABS_MIN：整体无相关。SCORE_DROP_ALL_BELOW=True 则全丢（触发拒答），
+       否则仅保底保留最高分 SCORE_MIN_KEEP 条；
+    3) 存在强锤点（最高分 >= SCORE_CONFIDENT）：启用相对断层，阈值 = max(SCORE_ABS_MIN, 最高分*SCORE_REL_RATIO)；
+    4) 只有中等分（无强锤点）：保守只用绝对下限 SCORE_ABS_MIN，不对中等分簇施断层（避免误杀最优项）；
+    5) 过滤后为空则保底保留最高分 SCORE_MIN_KEEP 条。
+    """
+    if not results or score_kind != "rerank" or SCORE_ABS_MIN <= 0:
+        return results, 0
+
+    max_score = results[0].get("score", 0.0)
+
+    # 2) 整体无相关：最高分也低于绝对下限
+    if max_score < SCORE_ABS_MIN:
+        if SCORE_DROP_ALL_BELOW:
+            return [], len(results)
+        keep = results[:max(1, SCORE_MIN_KEEP)]
+        return keep, len(results) - len(keep)
+
+    # 3)/4) 根据是否有强锤点选择断层阈值 or 仅绝对下限
+    if max_score >= SCORE_CONFIDENT:
+        threshold = max(SCORE_ABS_MIN, max_score * SCORE_REL_RATIO)
+    else:
+        threshold = SCORE_ABS_MIN
+
+    kept = [r for r in results if r.get("score", 0.0) >= threshold]
+
+    # 5) 保底：即使全部1阈值之上无命中，也保留最高分 N 条
+    if not kept:
+        kept = results[:max(1, SCORE_MIN_KEEP)]
+
+    return kept, len(results) - len(kept)
+
+
 class EmbeddingClient:
     """SiliconFlow Embedding API 客户端"""
 
@@ -129,25 +179,31 @@ class EmbeddingClient:
             "encoding_format": "float",
         }
 
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=60)
-            response.raise_for_status()
-            data = response.json()
+        with obs.span("embedding", input={"count": len(texts), "model": self.model}) as sp:
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=60)
+                response.raise_for_status()
+                data = response.json()
 
-            # 解析返回结果
-            embeddings = []
-            for item in data["data"]:
-                embeddings.append(item["embedding"])
+                # 解析返回结果
+                embeddings = []
+                for item in data["data"]:
+                    embeddings.append(item["embedding"])
 
-            logger.info(f"[Embedding] 成功获取 {len(embeddings)} 个向量，维度={len(embeddings[0]) if embeddings else 0}")
-            return embeddings
+                usage = obs.extract_usage(data)
+                sp.update(output={"count": len(embeddings)},
+                          metadata={"dim": len(embeddings[0]) if embeddings else 0, "usage": usage})
+                logger.info(f"[Embedding] 成功获取 {len(embeddings)} 个向量，维度={len(embeddings[0]) if embeddings else 0}")
+                return embeddings
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"[Embedding] API 请求失败: {e}")
-            raise
-        except (KeyError, IndexError) as e:
-            logger.error(f"[Embedding] 响应解析失败: {e}, 响应内容: {response.text[:500]}")
-            raise
+            except requests.exceptions.RequestException as e:
+                logger.error(f"[Embedding] API 请求失败: {e}")
+                sp.update(level="ERROR", status_message=str(e))
+                raise
+            except (KeyError, IndexError) as e:
+                logger.error(f"[Embedding] 响应解析失败: {e}, 响应内容: {response.text[:500]}")
+                sp.update(level="ERROR", status_message=str(e))
+                raise
 
     def embed_single(self, text: str) -> List[float]:
         """获取单条文本的 embedding"""
@@ -188,16 +244,18 @@ class RerankClient:
             "return_documents": False,
         }
 
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
-        response.raise_for_status()
-        data = response.json()
+        with obs.span("rerank", input={"query": query, "candidates": len(documents), "model": self.model}) as sp:
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+            data = response.json()
 
-        ranked = [
-            {"index": item["index"], "relevance_score": item["relevance_score"]}
-            for item in data["results"]
-        ]
-        logger.info(f"[Rerank] 候选 {len(documents)} 条精排完成，返回前 {len(ranked)} 条")
-        return ranked
+            ranked = [
+                {"index": item["index"], "relevance_score": item["relevance_score"]}
+                for item in data["results"]
+            ]
+            sp.update(output={"returned": len(ranked)})
+            logger.info(f"[Rerank] 候选 {len(documents)} 条精排完成，返回前 {len(ranked)} 条")
+            return ranked
 
 
 class VectorStore:
@@ -360,13 +418,16 @@ class VectorStore:
         logger.info(f"[Upsert] 总计写入 {total_inserted} 个 chunk")
         return total_inserted
 
-    def search(self, query: str, top_k: int = TOP_K, filter_dict: Optional[Dict] = None) -> List[Dict[str, Any]]:
+    def search(self, query: str, top_k: int = TOP_K, filter_dict: Optional[Dict] = None,
+               with_stats: bool = False):
         """
         检索（默认混合检索 + 可选精排）
         - RETRIEVAL_MODE=hybrid: dense + BM25 双通道召回，RRF 融合（推荐）
         - RETRIEVAL_MODE=vector: 仅 dense 向量检索（旧行为，做对照用）
         - RERANK_ENABLED=true: 先召回 RERANK_CANDIDATES 条候选，再交叉编码器精排取 top_k
-        返回: List[{"text": str, "score": float, "metadata": dict}]
+        返回: List[{"text": str, "score": float, "score_kind": str, "metadata": dict}]
+        with_stats=True 时额外返回统计: (results, {"dropped": int, "score_kind": str})，
+        dropped 为本次被低相关过滤掉的条数（供前端“已隐藏 N 条”徽标）。默认 False 保持旧行为。
         """
         # 获取查询向量（dense 通道）
         query_vector = self.embedding_client.embed_single(query)
@@ -398,6 +459,10 @@ class VectorStore:
 
         points = results.points
 
+        def _ret(res, dropped, kind):
+            # 统一出口：with_stats=True 时附带统计，否则只返回列表（旧行为）
+            return (res, {"dropped": dropped, "score_kind": kind}) if with_stats else res
+
         # Rerank 精排：候选按 (query, doc) 相关性重排后取 top_k；API 异常自动降级为原始排序
         if self.rerank_client and len(points) > 1:
             reranked = self._rerank_points(query, points, top_k)
@@ -406,23 +471,31 @@ class VectorStore:
                     {
                         "text": p.payload.get("text", ""),
                         "score": score,
+                        "score_kind": "rerank",
                         "metadata": {k: v for k, v in p.payload.items() if k != "text"},
                     }
                     for p, score in reranked
                 ]
-                logger.info(f"[Search] ({RETRIEVAL_MODE}+rerank) 查询 \"{query[:30]}...\" 返回 {len(formatted)} 条结果")
-                return formatted
+                # 低相关过滤：rerank 分为绝对相关量纲，可安全施加阈值
+                formatted, dropped = _filter_low_relevance(formatted, "rerank")
+                extra = f"，已过滤低相关 {dropped} 条" if dropped else ""
+                logger.info(f"[Search] ({RETRIEVAL_MODE}+rerank) 查询 \"{query[:30]}...\" 返回 {len(formatted)} 条结果{extra}")
+                return _ret(formatted, dropped, "rerank")
 
         # 未开启精排 / 精排降级：按召回原始顺序取前 top_k 条格式化
+        # 此处 score 为 RRF 融合分或原始向量分，量纲不可跨 query 比较，只截断不施加阈值
+        raw_kind = "rrf" if RETRIEVAL_MODE == "hybrid" else "vector"
         formatted = []
         for r in points[:top_k]:
             formatted.append({
                 "text": r.payload.get("text", ""),
                 "score": r.score,
+                "score_kind": raw_kind,
                 "metadata": {k: v for k, v in r.payload.items() if k != "text"},
             })
+        formatted, dropped = _filter_low_relevance(formatted, raw_kind)  # 非 rerank 量纲：原样返回，dropped=0
         logger.info(f"[Search] ({RETRIEVAL_MODE}) 查询 \"{query[:30]}...\" 返回 {len(formatted)} 条结果")
-        return formatted
+        return _ret(formatted, dropped, raw_kind)
 
     def _hybrid_query(self, query: str, query_vector: List[float], top_k: int,
                       query_filter: Optional[Filter]):

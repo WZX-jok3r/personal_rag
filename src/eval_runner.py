@@ -2,26 +2,36 @@
 eval_runner.py - 评测脚本
 
 功能:
-1. 读取 qa_test.jsonl 评测集
+1. 读取 qa_test_v2.jsonl 评测集
 2. 对每个问题执行 RAG 查询
 3. 计算指标:
-   - Recall@K: 期望来源文件是否在前 K 个检索结果中
+   - Recall@K: 期望来源文件是否在前 K 个检索结果中（口径排除 no_knowledge 拒答题）
    - Keyword Hit Rate: LLM 回答中包含多少 expected_keywords
-   - Source Match: 检索结果是否来自正确的文件
+   - MRR / Source Rank 分布: 区分"未召回"与"召回了但排序差"，为 rerank 决策提供依据
 4. 输出分类统计报告
 
 用法:
-    python src/eval_runner.py              # 运行全部评测
-    python src/eval_runner.py --top-k 10   # 指定 K 值
-    python src/eval_runner.py --output result_v1.json  # 保存详细结果
+    python src/eval_runner.py                          # 运行全部评测
+    python src/eval_runner.py --top-k 10               # 指定 K 值
+    python src/eval_runner.py --retrieval-only         # 仅测检索指标（跳过 LLM，轻量快速）
+    python src/eval_runner.py --dataset test_dataset/qa_test_v2.jsonl --output eval_v2.json
 """
 
 import json
 import argparse
 import logging
+import sys
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 from collections import defaultdict
+
+# Windows 下 stdout 被重定向（管道/文件）时默认走 GBK，emoji 会直接崩溃；统一强制 UTF-8
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 from config import TEST_DATASET_FILE
 from rag_pipeline import get_pipeline, RAGPipeline
@@ -38,12 +48,14 @@ def dump_text_report(report: Dict[str, Any], txt_path: Path):
     s = report["summary"]
     lines = []
     lines.append("=" * 60)
-    lines.append("📊 RAG 评测报告")
+    lines.append("📊 RAG 评测报告" + (" [retrieval-only]" if s.get("retrieval_only") else ""))
     lines.append("=" * 60)
-    lines.append(f"总问题数: {s['total_questions']}")
+    lines.append(f"总问题数: {s['total_questions']} (参与判定: {s.get('judged_questions', s['total_questions'])})")
     lines.append(f"通过: {s['passed']} | 失败: {s['failed']}")
     lines.append(f"通过率: {s['pass_rate'] * 100:.2f}%")
-    lines.append(f"Recall@K 命中率: {s['recall_at_k_rate'] * 100:.2f}% (K={s['top_k']})")
+    lines.append(f"Recall@K 命中率: {s['recall_at_k_rate'] * 100:.2f}% (K={s['top_k']}, 排除拒答题)")
+    lines.append(f"MRR: {s.get('mrr', 0):.4f}")
+    lines.append(f"Rank 分布: {s.get('rank_distribution', {})}")
     lines.append(f"平均关键词命中率: {s['avg_keyword_hit_rate'] * 100:.2f}%")
     lines.append("=" * 60)
     lines.append("")
@@ -63,8 +75,10 @@ def dump_text_report(report: Dict[str, Any], txt_path: Path):
     if report["failed_cases"]:
         lines.append("❌ 失败案例:")
         for i, fc in enumerate(report["failed_cases"], 1):
+            khr = fc.get("keyword_hit_rate")
+            khr_str = f"{khr * 100:.1f}%" if khr is not None else "N/A"
             lines.append(f"  {i}. [{fc['expected_source']}] {fc['question'][:80]}...")
-            lines.append(f"     Recall@K={fc['recall_at_k']}, KeywordHit={fc['keyword_hit_rate'] * 100:.1f}%")
+            lines.append(f"     Recall@K={fc['recall_at_k']}, Rank={fc.get('source_rank', -1)}, KeywordHit={khr_str}")
             lines.append(f"     回答: {fc['actual_answer'][:150]}...")
             lines.append("")
 
@@ -77,9 +91,11 @@ def dump_text_report(report: Dict[str, Any], txt_path: Path):
 class EvalRunner:
     """评测执行器"""
 
-    def __init__(self, pipeline: RAGPipeline, top_k: int = 5):
+    def __init__(self, pipeline: RAGPipeline, top_k: int = 5, retrieval_only: bool = False):
         self.pipeline = pipeline
         self.top_k = top_k
+        # retrieval_only: 跳过 LLM 生成，仅评测检索指标（Recall@K / Source Rank / MRR）
+        self.retrieval_only = retrieval_only
 
     def load_dataset(self, dataset_path: Path) -> List[Dict[str, Any]]:
         """加载 JSONL 评测集"""
@@ -109,8 +125,8 @@ class EvalRunner:
 
         logger.info(f"[Eval] 评测: {question[:50]}...")
 
-        # 执行 RAG 查询
-        result = self.pipeline.query(question, top_k=self.top_k)
+        # 执行 RAG 查询（retrieval_only 模式跳过 LLM 生成）
+        result = self.pipeline.query(question, top_k=self.top_k, generate=not self.retrieval_only)
         actual_answer = result["answer"]
         sources = result["sources"]
 
@@ -129,30 +145,38 @@ class EvalRunner:
 
         recall_at_k = normalized_expected_source in normalized_retrieved_sources if normalized_expected_source else None
 
-        # 2. 计算 Source Rank: 期望来源在结果中的排名（1‑based，未找到为 -1）
+        # 2. 计算 Source Rank: 期望来源在结果中的排名（1-based，未找到为 -1）
+        # 与 recall_at_k 保持一致，使用标准化后的名称对比（防御破折号变体）
         source_rank = -1
-        if expected_source:
-            for i, src in enumerate(retrieved_sources):
-                if src == expected_source:
+        if normalized_expected_source:
+            for i, src in enumerate(normalized_retrieved_sources):
+                if src == normalized_expected_source:
                     source_rank = i + 1
                     break
 
-        # 3. 计算 Keyword Hit Rate: 回答中包含多少期望关键词
-        answer_lower = actual_answer.lower()
-        keyword_hits = []
-        for kw in expected_keywords:
-            # 支持模糊匹配：去除空格和特殊字符后比较
-            kw_clean = kw.lower().replace(" ", "").replace("‑", "-")
-            ans_clean = answer_lower.replace(" ", "").replace("‑", "-")
-            hit = kw_clean in ans_clean
-            keyword_hits.append({"keyword": kw, "hit": hit})
+        # 3. 计算 Keyword Hit Rate: 回答中包含多少期望关键词（retrieval-only 模式无 LLM 回答，跳过）
+        if self.retrieval_only:
+            keyword_hits = []
+            keyword_hit_rate = None
+        else:
+            answer_lower = actual_answer.lower()
+            keyword_hits = []
+            for kw in expected_keywords:
+                # 支持模糊匹配：去除空格和特殊字符后比较
+                kw_clean = kw.lower().replace(" ", "").replace("‑", "-")
+                ans_clean = answer_lower.replace(" ", "").replace("‑", "-")
+                hit = kw_clean in ans_clean
+                keyword_hits.append({"keyword": kw, "hit": hit})
 
-        keyword_hit_rate = sum(1 for h in keyword_hits if h["hit"]) / len(keyword_hits) if keyword_hits else 0
+            keyword_hit_rate = sum(1 for h in keyword_hits if h["hit"]) / len(keyword_hits) if keyword_hits else 0
 
-        # 4. 综合评分（按 category 区分逻辑）
+        # 4. 综合评分（按 category / 评测模式区分逻辑）
         category = item.get("category", "未分类")
 
-        if category == "no_knowledge":
+        if self.retrieval_only:
+            # 快速检索模式：仅按 Recall@K 判定；no_knowledge 类无期望来源，不参与判定
+            passed = (recall_at_k is True) if category != "no_knowledge" else None
+        elif category == "no_knowledge":
             # 知识库外问题：期望模型正确"拒答"，而非给出编造的内容。
             # 正确拒答的判定：回答中包含明确的无法回答/未收录信号。
             # 注意: 此场景下 expected_keywords 通常是问题概念词（如 LangGraph、MemorySaver），
@@ -165,6 +189,15 @@ class EvalRunner:
                 "未能找到",
                 "未提及",
                 "没有提及",
+                "无法确定",
+                "无法找到",
+                "没有找到",
+                "无法提供",
+                "没有提供",
+                "未提供",
+                "未包含",
+                "没有说明",
+                "未说明",
             ]
             refusal_detected = any(kw in actual_answer for kw in refusal_keywords)
             passed = refusal_detected
@@ -189,7 +222,7 @@ class EvalRunner:
             "recall_at_k": recall_at_k,
             "source_rank": source_rank,
             "keyword_hits": keyword_hits,
-            "keyword_hit_rate": round(keyword_hit_rate, 4),
+            "keyword_hit_rate": round(keyword_hit_rate, 4) if keyword_hit_rate is not None else None,
             "passed": passed,
         }
 
@@ -223,16 +256,35 @@ class EvalRunner:
     def _generate_report(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """生成评测报告"""
         total = len(results)
-        passed = sum(1 for r in results if r.get("passed", False))
-        failed = total - passed
+        # 判定样本：passed 为 None（retrieval-only 下的拒答题）不参与通过率统计
+        judged = [r for r in results if r.get("passed") is not None]
+        passed = sum(1 for r in judged if r.get("passed") is True)
+        failed = len(judged) - passed
 
-        # 整体指标
-        recall_hits = [r for r in results if r.get("recall_at_k") is True]
-        recall_misses = [r for r in results if r.get("recall_at_k") is False]
-        recall_none = [r for r in results if r.get("recall_at_k") is None]
+        # 检索指标口径：仅统计知识库内问题（no_knowledge 期望来源不存在，纳入分母会失真）
+        kb_results = [r for r in results if r.get("category") != "no_knowledge"]
+        recall_hits = [r for r in kb_results if r.get("recall_at_k") is True]
+        recall_misses = [r for r in kb_results if r.get("recall_at_k") is False]
 
-        avg_keyword_hit = sum(
-            r.get("keyword_hit_rate", 0) for r in results if "keyword_hit_rate" in r) / total if total > 0 else 0
+        # MRR: 期望来源排名倒数的均值（未命中计 0），衡量排序质量
+        ranks = [r["source_rank"] for r in kb_results if r.get("source_rank", -1) > 0]
+        mrr = sum(1.0 / rank for rank in ranks) / len(kb_results) if kb_results else 0
+
+        # Source Rank 分布: 区分"未召回(miss)"与"召回但排序差(rank 靠后)"
+        rank_dist = {"rank_1": 0, "rank_2_3": 0, f"rank_4_{self.top_k}": 0, "miss": 0}
+        for r in kb_results:
+            sr = r.get("source_rank", -1)
+            if sr == 1:
+                rank_dist["rank_1"] += 1
+            elif 2 <= sr <= 3:
+                rank_dist["rank_2_3"] += 1
+            elif 4 <= sr <= self.top_k:
+                rank_dist[f"rank_4_{self.top_k}"] += 1
+            else:
+                rank_dist["miss"] += 1
+
+        hit_results = [r for r in results if r.get("keyword_hit_rate") is not None]
+        avg_keyword_hit = sum(r["keyword_hit_rate"] for r in hit_results) / len(hit_results) if hit_results else 0
 
         # 按 source_file 分类统计
         by_source = defaultdict(lambda: {"total": 0, "passed": 0, "recall_hits": 0})
@@ -251,7 +303,7 @@ class EvalRunner:
             by_category[cat]["total"] += 1
             if r.get("passed"):
                 by_category[cat]["passed"] += 1
-            if "keyword_hit_rate" in r:
+            if r.get("keyword_hit_rate") is not None:
                 by_category[cat]["avg_keyword_hit"].append(r["keyword_hit_rate"])
 
         # 计算分类平均
@@ -259,20 +311,24 @@ class EvalRunner:
             hits = by_category[cat]["avg_keyword_hit"]
             by_category[cat]["avg_keyword_hit"] = round(sum(hits) / len(hits), 4) if hits else 0
 
-        # 失败案例
-        failed_cases = [r for r in results if not r.get("passed", False)]
+        # 失败案例（仅统计有明确判定的题）
+        failed_cases = [r for r in judged if not r.get("passed")]
 
         report = {
             "summary": {
                 "total_questions": total,
+                "judged_questions": len(judged),
                 "passed": passed,
                 "failed": failed,
-                "pass_rate": round(passed / total, 4) if total > 0 else 0,
+                "pass_rate": round(passed / len(judged), 4) if judged else 0,
                 "recall_at_k_rate": round(len(recall_hits) / (len(recall_hits) + len(recall_misses)), 4) if (
                                                                                                                     len(recall_hits) + len(
                                                                                                                 recall_misses)) > 0 else 0,
                 "avg_keyword_hit_rate": round(avg_keyword_hit, 4),
+                "mrr": round(mrr, 4),
+                "rank_distribution": rank_dist,
                 "top_k": self.top_k,
+                "retrieval_only": self.retrieval_only,
             },
             "by_source": dict(by_source),
             "by_category": dict(by_category),
@@ -281,7 +337,8 @@ class EvalRunner:
                     "question": r["question"],
                     "expected_source": r.get("expected_source", ""),
                     "recall_at_k": r.get("recall_at_k"),
-                    "keyword_hit_rate": r.get("keyword_hit_rate", 0),
+                    "source_rank": r.get("source_rank", -1),
+                    "keyword_hit_rate": r.get("keyword_hit_rate"),
                     "actual_answer": r.get("actual_answer", "")[:200],
                 }
                 for r in failed_cases
@@ -294,13 +351,16 @@ class EvalRunner:
         """打印评测报告到控制台"""
         s = report["summary"]
 
+        mode_tag = " [retrieval-only]" if s.get("retrieval_only") else ""
         print("\n" + "=" * 60)
-        print("📊 RAG 评测报告")
+        print(f"📊 RAG 评测报告{mode_tag}")
         print("=" * 60)
-        print(f"总问题数: {s['total_questions']}")
+        print(f"总问题数: {s['total_questions']} (参与判定: {s.get('judged_questions', s['total_questions'])})")
         print(f"通过: {s['passed']} | 失败: {s['failed']}")
         print(f"通过率: {s['pass_rate'] * 100:.2f}%")
-        print(f"Recall@K 命中率: {s['recall_at_k_rate'] * 100:.2f}% (K={s['top_k']})")
+        print(f"Recall@K 命中率: {s['recall_at_k_rate'] * 100:.2f}% (K={s['top_k']}, 排除拒答题)")
+        print(f"MRR: {s.get('mrr', 0):.4f}")
+        print(f"Rank 分布: {s.get('rank_distribution', {})}")
         print(f"平均关键词命中率: {s['avg_keyword_hit_rate'] * 100:.2f}%")
         print("=" * 60)
 
@@ -317,8 +377,10 @@ class EvalRunner:
         if report["failed_cases"]:
             print("\n❌ 失败案例:")
             for i, fc in enumerate(report["failed_cases"][:5], 1):
+                khr = fc.get("keyword_hit_rate")
+                khr_str = f"{khr * 100:.1f}%" if khr is not None else "N/A"
                 print(f"  {i}. [{fc['expected_source']}] {fc['question'][:60]}...")
-                print(f"     Recall@K={fc['recall_at_k']}, KeywordHit={fc['keyword_hit_rate'] * 100:.1f}%")
+                print(f"     Recall@K={fc['recall_at_k']}, Rank={fc.get('source_rank', -1)}, KeywordHit={khr_str}")
                 print(f"     回答: {fc['actual_answer'][:100]}...")
 
         print("\n" + "=" * 60)
@@ -330,6 +392,8 @@ def main():
     parser.add_argument("--dataset", type=str, default=str(default_dataset_path),
                         help="评测集路径 (JSONL 格式)")
     parser.add_argument("--top-k", type=int, default=5, help="检索 Top‑K")
+    parser.add_argument("--retrieval-only", action="store_true",
+                        help="仅评测检索指标（跳过 LLM 生成，轻量快速）")
     # 这里只传文件名，不要文件夹路径
     parser.add_argument("--output", type=str, default="eval_result.json", help="输出文件名，保存到 output/eval/")
     args = parser.parse_args()
@@ -350,10 +414,11 @@ def main():
     # 初始化
     logger.info("[Eval] 初始化 RAG Pipeline...")
     pipeline = get_pipeline()
-    runner = EvalRunner(pipeline, top_k=args.top_k)
+    runner = EvalRunner(pipeline, top_k=args.top_k, retrieval_only=args.retrieval_only)
 
     # 执行评测
-    logger.info(f"[Eval] 开始评测 (Top‑K={args.top_k})...")
+    mode_desc = "retrieval-only（跳过 LLM）" if args.retrieval_only else "完整评测"
+    logger.info(f"[Eval] 开始评测 ({mode_desc}, Top‑K={args.top_k})...")
     eval_result = runner.run(dataset_path)
 
     if not eval_result:

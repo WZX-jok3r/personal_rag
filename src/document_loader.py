@@ -137,6 +137,12 @@ from config import (
     PDF_SUBDIR,
 )
 
+# marker 深度表格识别开关（默认关闭，需显式开启；未安装 marker 时自动优雅降级）
+try:
+    from config import USE_MARKER_FOR_PDF
+except ImportError:
+    USE_MARKER_FOR_PDF = False
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -485,6 +491,99 @@ def extract_tables_from_page(page, file_path: Path, page_num: int) -> List[Dict]
     return tables
 
 
+def _convert_pdf_with_marker(file_path, timeout: int = 900) -> Optional[str]:
+    """
+    用 marker（marker_single CLI + --disable_ocr 纯文本层）把 PDF 转成 Markdown。
+
+    为什么用 CLI 而非 Python API：
+    - marker 2.0 的 Python API 默认 balanced 模式会初始化/下载 OCR VLM 大模型，
+      国内网络下容易卡死；CLI 的 --disable_ocr 走纯文本层 + pdftext 表格重建，
+      CPU 可跑、不需要 OCR 模型，对 digital PDF（有文本层）即可结构化无线表格。
+    - 复用本机已安装的 marker_single 命令，行为与手工验证完全一致。
+
+    成功返回 Markdown 文本，失败或不可用返回 None（调用方优雅降级）。
+    """
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+
+    # 定位 marker_single 可执行文件（优先 PATH，回退到当前解释器的 Scripts 目录）
+    marker_cmd = shutil.which("marker_single")
+    if not marker_cmd:
+        scripts_dir = Path(sys.executable).parent
+        for cand in ("marker_single", "marker_single.exe"):
+            p = scripts_dir / cand
+            if p.exists():
+                marker_cmd = str(p)
+                break
+    if not marker_cmd:
+        logger.info("[PDF] 未找到 marker_single 命令，跳过 marker 深度表格识别")
+        return None
+
+    out_dir = tempfile.mkdtemp(prefix="marker_out_")
+    cmd = [marker_cmd, str(file_path), "--output_dir", out_dir, "--disable_ocr"]
+    logger.info(f"[PDF] 调用 marker 识别无线表格: {Path(file_path).name}")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0:
+            logger.warning(f"[PDF] marker 转换失败: {(result.stderr or '')[-400:]}")
+            return None
+        md_files = sorted(Path(out_dir).rglob("*.md"))
+        if not md_files:
+            logger.warning("[PDF] marker 未产出 markdown 文件")
+            return None
+        return md_files[0].read_text(encoding="utf-8").strip() or None
+    except subprocess.TimeoutExpired:
+        logger.warning(f"[PDF] marker 转换超时（>{timeout}s），跳过")
+        return None
+    except Exception as e:
+        logger.warning(f"[PDF] marker 调用失败: {e}")
+        return None
+
+
+def _detect_likely_table_pdf(doc) -> bool:
+    """
+    启发式：检测 PDF 是否疑似含"多列/无线表格"。
+    依据：文本 span 的左边缘 x0 是否聚类成多个列带（>=3），且多数页面满足。
+    - 普通段落文本 x0 基本一致（1 个列带）→ 不触发
+    - 无线表格/多列表格 x0 聚成多个列带 → 触发 marker 兜底
+    返回 True 表示疑似含表格，值得尝试 marker 深度识别。
+    """
+    try:
+        col_band_counts = []
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            x0s = []
+            for block in page.get_text("dict").get("blocks", []):
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        t = span.get("text", "").strip()
+                        if t:
+                            x0s.append(span.get("bbox", [0, 0, 0, 0])[0])
+            if not x0s:
+                continue
+            xs = sorted(set(round(x, 1) for x in x0s))
+            clusters = []
+            cur = [xs[0]]
+            for x in xs[1:]:
+                if x - cur[-1] <= 8.0:
+                    cur.append(x)
+                else:
+                    clusters.append(len(cur))
+                    cur = [x]
+            clusters.append(len(cur))
+            col_band_counts.append(len(clusters))
+        if not col_band_counts:
+            return False
+        multi = sum(1 for c in col_band_counts if c >= 3)
+        return (multi / len(col_band_counts)) >= 0.5
+    except Exception:
+        return False
+
+
 def detect_columns(page, threshold=0.45) -> List[Tuple[float, float]]:
     """
     检测页面分栏布局
@@ -597,37 +696,37 @@ def _try_ocr_page(page) -> str:
 def extract_logical_page_number(text: str) -> Optional[int]:
     """
     从页面文本中提取逻辑页码（内容中标注的页码）
-    
+
     常见页码格式:
     - "Page 39 of 50" (西式页码)
     - "第39页/50" (中文页码)
     - "P.39" (简写)
-    
+
     返回: 逻辑页码 (如39)，未找到返回None
     """
     import re
-    
+
     # 页脚/页眉常见的页码模式
     page_patterns = [
-        (r'Page\s+(\d+)\s+of\s+\d+', 1),        # Page 39 of 50
-        (r'第\s*(\d+)\s*页\s*[^\d]*\d+', 1),    # 第39页/50
-        (r'(\d+)\s*/\s*\d+\s*[页Pp]', 1),       # 39/50页, 39/50P
-        (r'[Pp]\.\s*(\d+)', 1),                 # P.39, p.39
-        (r'页码[:：]?\s*(\d+)', 1),              # 页码:39
-        (r'^(\d+)\s*$', 1),                     # 单独的数字行（可能是页码）
+        (r'Page\s+(\d+)\s+of\s+\d+', 1),  # Page 39 of 50
+        (r'第\s*(\d+)\s*页\s*[^\d]*\d+', 1),  # 第39页/50
+        (r'(\d+)\s*/\s*\d+\s*[页Pp]', 1),  # 39/50页, 39/50P
+        (r'[Pp]\.\s*(\d+)', 1),  # P.39, p.39
+        (r'页码[:：]?\s*(\d+)', 1),  # 页码:39
+        (r'^(\d+)\s*$', 1),  # 单独的数字行（可能是页码）
     ]
-    
+
     # 检查文本的末尾部分（页脚通常在这里）
     lines = text.strip().split('\n')
-    
+
     # 优先检查最后几行（页脚区域）
     footer_lines = lines[-5:] if len(lines) >= 5 else lines
-    
+
     for line in footer_lines:
         line_clean = line.strip()
         if not line_clean:
             continue
-            
+
         for pattern, group_idx in page_patterns:
             match = re.search(pattern, line_clean, re.IGNORECASE)
             if match:
@@ -639,7 +738,7 @@ def extract_logical_page_number(text: str) -> Optional[int]:
                         return page_num
                 except (ValueError, IndexError):
                     continue
-    
+
     # 如果页脚没找到，搜索整个文本（但优先级较低）
     whole_text = text.strip()
     for pattern, group_idx in page_patterns:
@@ -654,7 +753,7 @@ def extract_logical_page_number(text: str) -> Optional[int]:
                     return page_num
             except (ValueError, IndexError):
                 continue
-    
+
     return None
 
 
@@ -698,6 +797,7 @@ def load_pdf(file_path: Path) -> List[Document]:
     try:
         doc = pymupdf.open(file_path)
         total_pages = len(doc)
+        extracted_table = False  # 标记整篇是否成功提取到表格
 
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
@@ -720,6 +820,8 @@ def load_pdf(file_path: Path) -> List[Document]:
                 # 普通PDF -> 多策略提取
                 # 2a: 提取表格（渐进式降级：pdfplumber -> get_tables -> dict）
                 tables = extract_tables_from_page(page, file_path, page_num)
+                if tables:
+                    extracted_table = True
                 for table_info in tables:
                     page_contents.append({
                         "type": "table",
@@ -768,7 +870,7 @@ def load_pdf(file_path: Path) -> List[Document]:
                     logical_page = extract_logical_page_number(combined_text)
                     has_logical_page = logical_page is not None
                     display_page = logical_page if has_logical_page else (page_num + 1)
-                    
+
                     # 确定使用的页码标签（优先使用逻辑页码）
                     if has_logical_page:
                         page_num_label = f"【第{display_page}页(逻辑)/{total_pages}页】"
@@ -776,7 +878,7 @@ def load_pdf(file_path: Path) -> List[Document]:
                     else:
                         page_num_label = f"【第{display_page}页(物理)/{total_pages}页】"
                         page_note = f"文件物理页码:{page_num + 1}, 未找到内容标注页码"
-                    
+
                     annotated_text = page_num_label + "\n" + page_note + "\n" + combined_text.strip()
 
                     # 构建双页码元数据
@@ -792,7 +894,7 @@ def load_pdf(file_path: Path) -> List[Document]:
                         "page_height": page_info["page_height"],
                         # v5 新增：双页码系统字段
                         "physical_page": page_num + 1,  # 物理页码（文件结构）
-                        "logical_page": logical_page,   # 逻辑页码（内容标注）
+                        "logical_page": logical_page,  # 逻辑页码（内容标注）
                         "has_logical_page": has_logical_page,
                         "page_numbering_system": "logical" if has_logical_page else "physical",
                         "page_numbering_source": "content_marker" if has_logical_page else "file_structure",
@@ -803,6 +905,32 @@ def load_pdf(file_path: Path) -> List[Document]:
                         text=annotated_text,
                         metadata=metadata,
                     ))
+
+            # === marker 深度表格识别兜底 ===
+            # 触发条件：三级表格提取全失败 + 疑似含无线/多列表格 + 开关开启。
+            # marker 结果作为独立 Document(parser="marker") 追加（不删除按页结果），
+            # 保证页码类问题仍可由按页块命中；表格类问题由 marker 的 Markdown 块命中。
+            # chunk_strategy 已预留路由：parser=="marker" → 自动走 md 表格感知切分。
+            if (not extracted_table and USE_MARKER_FOR_PDF
+                    and _detect_likely_table_pdf(doc)):
+                logger.info(f"[PDF] 疑似无线表格且三级提取失败，尝试 marker 深度识别: {file_path.name}")
+                md_text = _convert_pdf_with_marker(file_path)
+                if md_text:
+                    documents.append(Document(
+                        text=md_text,
+                        metadata={
+                            "source": file_path.name,
+                            "full_path": str(file_path),
+                            "format": "pdf",
+                            "type": "markdown",
+                            "parser": "marker",
+                            "total_pages": total_pages,
+                        },
+                    ))
+                    logger.info(f"[PDF] marker 转换成功，追加 Markdown 文档块: {file_path.name}")
+                else:
+                    logger.info(f"[PDF] marker 未安装或转换失败，保持原有按页解析结果")
+
         doc.close()
 
         if not documents:

@@ -140,9 +140,13 @@ class RAGPipeline:
             logger.error(f"[LLM] 响应解析失败: {e}")
             return "抱歉，模型响应格式异常，请稍后重试。"
 
-    def query(self, query: str, top_k: int = TOP_K, filter_dict: Optional[Dict] = None) -> Dict[str, Any]:
+    def query(self, query: str, top_k: int = TOP_K, filter_dict: Optional[Dict] = None,
+              generate: bool = True) -> Dict[str, Any]:
         """
         执行完整 RAG 查询
+
+        Args:
+            generate: True=检索+LLM 生成；False=仅检索（评测快速模式，跳过 LLM 调用）
 
         Returns:
             {
@@ -162,15 +166,14 @@ class RAGPipeline:
                 "retrieved_count": 0,
             }
 
-        # 2. 组装 context
-        context = self._build_context(chunks)
-
-        # 3. 组装 system prompt
-        system_prompt = self.SYSTEM_PROMPT.format(context=context)
-
-        # 4. 调用 LLM
-        logger.info(f"[LLM] 调用 {self.model} 生成回答...")
-        answer = self._call_llm(system_prompt, query)
+        # 2~4. 组装 context + 调用 LLM（retrieval-only 模式跳过生成环节）
+        if generate:
+            context = self._build_context(chunks)
+            system_prompt = self.SYSTEM_PROMPT.format(context=context)
+            logger.info(f"[LLM] 调用 {self.model} 生成回答...")
+            answer = self._call_llm(system_prompt, query)
+        else:
+            answer = "(retrieval-only：已跳过 LLM 生成)"
 
         # 5. 格式化 sources
         sources = []
@@ -193,13 +196,14 @@ class RAGPipeline:
         }
 
     def query_with_history(self, query: str, history: List[Dict[str, str]],
-                           top_k: int = TOP_K) -> Dict[str, Any]:
+                           top_k: int = TOP_K, filter_dict: Optional[Dict] = None) -> Dict[str, Any]:
         """
         带历史对话的 RAG 查询
         history: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+        filter_dict: 服务端强制的元数据过滤（如多租户 tenant_id 隔离）
         """
-        # 1. 检索（基于当前 query）
-        chunks = self._retrieve(query, top_k=top_k)
+        # 1. 检索（基于当前 query，叠加服务端强制过滤）
+        chunks = self._retrieve(query, top_k=top_k, filter_dict=filter_dict)
         context = self._build_context(chunks) if chunks else "无相关参考资料"
 
         # 2. 组装 messages

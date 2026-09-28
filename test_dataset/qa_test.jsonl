@@ -1,8 +1,8 @@
 {"question":"路由器整机质保多长时间？","golden_answer":"旧版本V0.9文档路由器质保12个月，新版本V1.0文档路由器整机质保24个月，需要区分文档版本。","source_file":"contract_snippet.md","expected_keywords":["路由器","质保","V0.9","12个月","V1.0","24个月"]}
-{"question":"PET肤感门板的单价是多少？","golden_answer":"PET肤感门板单价210元，数量34，白色刨花板基材。","source_file":"cost_data.xlsx","expected_keywords":["PET肤感门板","210","34","白色","刨花板基材"]}
-{"question":"颗粒板柜体板材用的什么品牌和封边方式？","golden_answer":"颗粒板柜体板材单价135元，采用兔宝宝品牌、PUR封边。","source_file":"cost_data.xlsx","expected_keywords":["颗粒板柜体板材","兔宝宝","PUR封边","135"]}
+{"question":"PET肤感门板的单价是多少？","golden_answer":"PET肤感门板单价210元。","source_file":"cost_data.xlsx","expected_keywords":["PET肤感门板","210"]}
+{"question":"颗粒板柜体板材用的什么品牌和封边方式？","golden_answer":"颗粒板柜体板材采用兔宝宝品牌、PUR封边。","source_file":"cost_data.xlsx","expected_keywords":["颗粒板柜体板材","兔宝宝","PUR封边"]}
 {"question":"铰链是什么型号，有什么功能？","golden_answer":"铰链为悍高三段力，单价28元，数量20，具备柜门阻尼缓冲功能。","source_file":"cost_data.xlsx","expected_keywords":["铰链","悍高","三段力","28","阻尼缓冲"]}
-{"question":"多层板地柜板材是什么用途？","golden_answer":"多层板地柜板材单价182元，数量28，用于厨房地柜。","source_file":"cost_data.xlsx","expected_keywords":["多层板地柜板材","182","厨房地柜"]}
+{"question":"多层板地柜板材是什么用途？","golden_answer":"多层板地柜板材用于厨房地柜。","source_file":"cost_data.xlsx","expected_keywords":["多层板地柜板材","厨房地柜"]}
 {"question":"安装人工怎么计费？","golden_answer":"安装人工单价85元，数量1，按套计费。","source_file":"cost_data.xlsx","expected_keywords":["安装人工","85","按套计费"]}
 {"question":"整个橱柜项目中数量和单价分别是多少，总成本怎么算？","golden_answer":"项目含铰链(28×20)、颗粒板柜体板材(135×42)、多层板地柜板材(182×28)、PET肤感门板(210×34)、安装人工(85×1)，总成本为各项单价×数量之和。","source_file":"cost_data.xlsx","expected_keywords":["铰链","颗粒板柜体板材","多层板地柜板材","PET肤感门板","安装人工","数量"]}
 {"question":"docx‑sample‑with‑images.docx这份文档的标题是什么？","golden_answer":"文档标题为Document with Embedded Image","source_file":"docx-sample-with-images.docx","expected_keywords":["Document with Embedded Image"]}

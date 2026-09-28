@@ -5,7 +5,7 @@ webui.py - Gradio 问答小助手前端
 1. 单轮问答：输入问题，返回答案 + 引用来源
 2. 多轮对话：支持连续对话，保留历史上下文
 3. 显示检索到的参考资料（可展开查看）
-4. 显示来源文件和相似度分数
+4. 显示来源文件和相关度分数
 
 用法:
     python src/webui.py
@@ -16,6 +16,7 @@ import gradio as gr
 import logging
 from typing import List, Dict, Any, Tuple
 
+from config import RETRIEVAL_MODE, RERANK_ENABLED, RERANK_MODEL, RERANK_CANDIDATES
 from rag_pipeline import get_pipeline, RAGPipeline
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -39,9 +40,16 @@ def format_sources(sources: List[Dict[str, Any]]) -> str:
     if not sources:
         return "*未找到相关参考资料*"
 
+    # score 语义随检索链路变化：rerank 精排为 relevance_score，混合检索为 RRF 融合分，纯向量为余弦相似度
+    if RERANK_ENABLED:
+        score_label = "相关度(rerank)"
+    elif RETRIEVAL_MODE == "hybrid":
+        score_label = "相关度(RRF)"
+    else:
+        score_label = "相似度"
     lines = []
     for i, s in enumerate(sources, 1):
-        lines.append(f"**[{i}]** `{s['source']}` ({s['format']}) — 相似度: {s['score']}")
+        lines.append(f"**[{i}]** `{s['source']}` ({s['format']}) — {score_label}: {s['score']}")
         preview = s.get("text_preview", "")
         if preview:
             lines.append(f"> {preview[:150]}{'...' if len(preview) > 150 else ''}")
@@ -211,11 +219,17 @@ def build_ui() -> gr.Blocks:
             )
 
         with gr.Tab("ℹ️ 系统信息"):
-            gr.Markdown("""
+            rerank_info = (
+                f"{RERANK_MODEL}（SiliconFlow，候选 {RERANK_CANDIDATES} 条精排取 Top-K）"
+                if RERANK_ENABLED else "未启用"
+            )
+            gr.Markdown(f"""
             ### 系统配置
             - **Embedding 模型**: BAAI/bge-m3 (SiliconFlow)
             - **LLM 模型**: DeepSeek-V3.2 (SiliconFlow)
             - **向量库**: Qdrant (本地 Docker)
+            - **检索模式**: 混合检索（dense 语义 + BM25 关键词，jieba 中文分词，RRF 融合）
+            - **Rerank 精排**: {rerank_info}
             - **支持格式**: PDF, DOCX, XLSX, MD, TXT
 
             ### 使用说明

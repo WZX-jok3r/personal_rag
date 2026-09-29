@@ -4,14 +4,17 @@
 import type {
   ChatRequest,
   ChatResponse,
+  DocumentListResponse,
   HealthInfo,
+  IngestTaskStatus,
   QueryRequest,
   QueryResponse,
   SessionCreated,
   StreamEvent,
+  UploadResponse,
 } from "./types";
 
-const BASE = "/api";
+const BASE = "/api/v1";
 
 // API Key：优先取构建时环境变量 VITE_RAG_API_KEY，其次 localStorage（便于运行时手动填入）。
 // 后端开启鉴权（配置了 RAG_TENANT_KEYS）时必须携带，否则 401。
@@ -25,7 +28,24 @@ function getApiKey(): string {
   }
 }
 
-/** 通用请求：非 2xx 统一抛出带后端 detail 的错误 */
+/** 从非 2xx 响应中提取可读错误信息。
+ * 后端统一错误体为 {error:{message,code,status}}；兼容旧式 {detail} 。 */
+async function readErrorMessage(resp: Response): Promise<string> {
+  let detail = `${resp.status} ${resp.statusText}`;
+  try {
+    const body = await resp.json();
+    if (body && body.error && body.error.message) {
+      detail = String(body.error.message);
+    } else if (body && body.detail) {
+      detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+    }
+  } catch {
+    // 忽略解析失败，回退到状态行
+  }
+  return detail;
+}
+
+/** 通用请求：非 2xx 统一抛出带后端错误信息的异常 */
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -40,14 +60,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   });
 
   if (!resp.ok) {
-    let detail = `${resp.status} ${resp.statusText}`;
-    try {
-      const err = await resp.json();
-      if (err && err.detail) detail = String(err.detail);
-    } catch {
-      // 忽略解析失败，回退到状态行
-    }
-    throw new Error(detail);
+    throw new Error(await readErrorMessage(resp));
   }
 
   return (await resp.json()) as T;
@@ -98,14 +111,7 @@ export async function chatStream(
   });
 
   if (!resp.ok || !resp.body) {
-    let detail = `${resp.status} ${resp.statusText}`;
-    try {
-      const err = await resp.json();
-      if (err && err.detail) detail = String(err.detail);
-    } catch {
-      // 忽略解析失败，回退到状态行
-    }
-    throw new Error(detail);
+    throw new Error(await readErrorMessage(resp));
   }
 
   const reader = resp.body.getReader();
@@ -143,4 +149,30 @@ export function deleteSession(sessionId: string): Promise<void> {
   return request<void>(`/sessions/${encodeURIComponent(sessionId)}`, {
     method: "DELETE",
   });
+}
+
+/**
+ * 上传文档到知识库（multipart）：后端落盘 + 入队后立即返回 task_id（202）。
+ * 不手动设 Content-Type，交由浏览器带 multipart 边界；只需带 X-API-Key。
+ */
+export async function uploadDocument(file: File): Promise<UploadResponse> {
+  const headers: Record<string, string> = {};
+  const key = getApiKey();
+  if (key) headers["X-API-Key"] = key;
+  const form = new FormData();
+  form.append("file", file);
+
+  const resp = await fetch(`${BASE}/documents`, { method: "POST", headers, body: form });
+  if (!resp.ok) throw new Error(await readErrorMessage(resp));
+  return (await resp.json()) as UploadResponse;
+}
+
+/** 轮询入库任务状态（queued/running/done/failed + progress） */
+export function getIngestStatus(taskId: string): Promise<IngestTaskStatus> {
+  return request<IngestTaskStatus>(`/documents/${encodeURIComponent(taskId)}/status`);
+}
+
+/** 列出当前租户已登记文档 */
+export function listDocuments(): Promise<DocumentListResponse> {
+  return request<DocumentListResponse>("/documents");
 }

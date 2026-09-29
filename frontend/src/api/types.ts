@@ -65,3 +65,35 @@ export interface HealthInfo {
   rerank_candidates: number | null;
   default_top_k: number;
 }
+
+/** POST /api/documents 上传响应（202 已接收、后台入库中） */
+export interface UploadResponse {
+  task_id: string;
+  filename: string;
+  status: string;
+  message?: string;
+}
+
+/** GET /api/documents/{task_id}/status 入库任务状态 */
+export interface IngestTaskStatus {
+  task_id: string;
+  document_id: number | null;
+  status: string; // queued | running | done | failed
+  progress: number; // 0~100
+  error?: string | null;
+}
+
+/** 单条已登记文档 */
+export interface DocumentItem {
+  id: number;
+  source: string;
+  format: string;
+  status: string;
+  chunk_count: number;
+}
+
+/** GET /api/documents 列表响应 */
+export interface DocumentListResponse {
+  documents: DocumentItem[];
+  total: number;
+}

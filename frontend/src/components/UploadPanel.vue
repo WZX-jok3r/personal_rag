@@ -1,0 +1,355 @@
+<script setup lang="ts">
+// 文档上传面板（抽屉）：选文件 → 异步入队（202 返回 task_id）→ 轮询任务状态/进度。
+// 入库由后端 ARQ worker 在后台完成，这里只负责触发与观测。
+
+import { ref, onBeforeUnmount, watch } from "vue";
+import * as api from "../api/client";
+import type { DocumentItem, IngestTaskStatus } from "../api/types";
+
+const props = defineProps<{ open: boolean }>();
+const emit = defineEmits<{ (e: "close"): void }>();
+
+interface Task extends IngestTaskStatus {
+  filename: string;
+}
+
+const fileInput = ref<HTMLInputElement | null>(null);
+const picked = ref<File | null>(null);
+const uploading = ref(false);
+const error = ref("");
+const tasks = ref<Task[]>([]);
+const docs = ref<DocumentItem[]>([]);
+
+let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+const ACTIVE = new Set(["queued", "running"]);
+
+async function refreshDocs() {
+  try {
+    const res = await api.listDocuments();
+    docs.value = res.documents;
+  } catch {
+    // 列表失败不阻断上传功能
+  }
+}
+
+function ensurePolling() {
+  if (pollTimer) return;
+  pollTimer = setInterval(pollActive, 1500);
+}
+
+function stopPollingIfIdle() {
+  if (pollTimer && !tasks.value.some((t) => ACTIVE.has(t.status))) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+    refreshDocs();
+  }
+}
+
+async function pollActive() {
+  const active = tasks.value.filter((t) => ACTIVE.has(t.status));
+  for (const t of active) {
+    try {
+      const st = await api.getIngestStatus(t.task_id);
+      t.status = st.status;
+      t.progress = st.progress;
+      t.error = st.error;
+      t.document_id = st.document_id;
+    } catch (e) {
+      t.status = "failed";
+      t.error = (e as Error).message;
+    }
+  }
+  stopPollingIfIdle();
+}
+
+function onPick(ev: Event) {
+  const target = ev.target as HTMLInputElement;
+  picked.value = target.files && target.files[0] ? target.files[0] : null;
+  error.value = "";
+}
+
+async function onUpload() {
+  if (!picked.value || uploading.value) return;
+  uploading.value = true;
+  error.value = "";
+  const file = picked.value;
+  try {
+    const res = await api.uploadDocument(file);
+    tasks.value.unshift({
+      task_id: res.task_id,
+      filename: res.filename,
+      document_id: null,
+      status: res.status || "queued",
+      progress: 0,
+      error: null,
+    });
+    ensurePolling();
+    picked.value = null;
+    if (fileInput.value) fileInput.value.value = "";
+  } catch (e) {
+    error.value = (e as Error).message;
+  } finally {
+    uploading.value = false;
+  }
+}
+
+function close() {
+  emit("close");
+}
+
+watch(
+  () => props.open,
+  (v) => {
+    if (v) refreshDocs();
+  },
+);
+
+onBeforeUnmount(() => {
+  if (pollTimer) clearInterval(pollTimer);
+});
+
+function badgeClass(status: string) {
+  return `badge badge-${status}`;
+}
+</script>
+
+<template>
+  <div v-if="open" class="overlay" @click.self="close">
+    <aside class="panel">
+      <header class="panel-head">
+        <h2>📄 文档入库</h2>
+        <button class="close" @click="close">✕</button>
+      </header>
+
+      <section class="upload-box">
+        <input
+          ref="fileInput"
+          type="file"
+          accept=".pdf,.docx,.xlsx,.md,.txt"
+          @change="onPick"
+        />
+        <button class="upload" :disabled="!picked || uploading" @click="onUpload">
+          {{ uploading ? "上传中…" : "上传并入库" }}
+        </button>
+        <p class="hint">支持 pdf / docx / xlsx / md / txt；上传后后台异步解析入库。</p>
+        <p v-if="error" class="err">{{ error }}</p>
+      </section>
+
+      <section class="tasks">
+        <h3>本次入库任务</h3>
+        <p v-if="tasks.length === 0" class="empty">暂无任务</p>
+        <ul>
+          <li v-for="t in tasks" :key="t.task_id" class="task">
+            <div class="task-top">
+              <span class="fname">{{ t.filename }}</span>
+              <span :class="badgeClass(t.status)">{{ t.status }}</span>
+            </div>
+            <div class="progress">
+              <div class="bar" :style="{ width: t.progress + '%' }"></div>
+            </div>
+            <div class="task-meta">
+              <span>{{ t.progress }}%</span>
+              <span v-if="t.error" class="err">· {{ t.error }}</span>
+            </div>
+          </li>
+        </ul>
+      </section>
+
+      <section class="docs">
+        <h3>知识库已登记文档</h3>
+        <p v-if="docs.length === 0" class="empty">暂无文档</p>
+        <ul>
+          <li v-for="d in docs" :key="d.id" class="doc">
+            <span class="fname">{{ d.source }}</span>
+            <span class="dim">{{ d.format }} · {{ d.chunk_count }} 块 · {{ d.status }}</span>
+          </li>
+        </ul>
+      </section>
+    </aside>
+  </div>
+</template>
+
+<style scoped>
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(2, 6, 23, 0.55);
+  backdrop-filter: blur(3px);
+  display: flex;
+  justify-content: flex-end;
+  z-index: 50;
+}
+
+.panel {
+  width: 420px;
+  max-width: 92vw;
+  height: 100%;
+  overflow-y: auto;
+  background: rgba(15, 23, 42, 0.92);
+  border-left: 1px solid var(--border);
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.panel-head h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.close {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 10px;
+  width: 32px;
+  height: 32px;
+  cursor: pointer;
+}
+
+.upload-box {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  background: rgba(30, 41, 59, 0.5);
+}
+
+.upload-box input[type="file"] {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.upload {
+  background: linear-gradient(135deg, #6366f1, #06b6d4);
+  color: #fff;
+  border: none;
+  border-radius: 12px;
+  padding: 10px 14px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.upload:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.hint {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0;
+}
+
+.err {
+  color: var(--danger);
+  font-size: 12px;
+  margin: 0;
+}
+
+.tasks h3,
+.docs h3 {
+  font-size: 14px;
+  margin: 0 0 10px;
+  color: var(--fg);
+}
+
+.empty {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.task {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--card);
+}
+
+.task-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.fname {
+  font-size: 13px;
+  word-break: break-all;
+}
+
+.badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.badge-queued {
+  color: #fbbf24;
+}
+.badge-running {
+  color: #38bdf8;
+}
+.badge-done {
+  color: #22c55e;
+}
+.badge-failed {
+  color: var(--danger);
+}
+
+.progress {
+  height: 6px;
+  border-radius: 9999px;
+  background: rgba(148, 163, 184, 0.2);
+  overflow: hidden;
+}
+
+.bar {
+  height: 100%;
+  background: linear-gradient(90deg, #6366f1, #06b6d4);
+  transition: width 0.4s ease;
+}
+
+.task-meta {
+  display: flex;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 6px;
+}
+
+.doc {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(30, 41, 59, 0.4);
+}
+
+.dim {
+  font-size: 12px;
+  color: var(--muted);
+}
+</style>

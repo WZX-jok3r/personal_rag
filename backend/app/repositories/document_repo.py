@@ -17,6 +17,23 @@ class DocumentRepository(BaseRepository):
         )
         return (await self._session.execute(stmt)).scalar_one_or_none()
 
+    async def get_by_id(
+        self, doc_id: int, tenant_id: Optional[str]
+    ) -> Optional[Document]:
+        """按主键取文档；tenant_id 非空时做归属校验（跨租户视为不存在）。"""
+        stmt = select(Document).where(Document.id == doc_id)
+        if tenant_id is not None:
+            stmt = stmt.where(Document.tenant_id == tenant_id)
+        return (await self._session.execute(stmt)).scalar_one_or_none()
+
+    async def delete(self, doc: Document) -> None:
+        """删除文档登记行（关联 ingest_tasks.document_id 由 DB 层 ON DELETE SET NULL 置空）。
+
+        仅 flush，提交由上层 service 掌控，保持事务边界一致。
+        """
+        await self._session.delete(doc)
+        await self.flush()
+
     async def list_by_tenant(self, tenant_id: Optional[str]) -> List[Document]:
         stmt = select(Document).where(Document.tenant_id == tenant_id).order_by(Document.id)
         return list((await self._session.execute(stmt)).scalars().all())

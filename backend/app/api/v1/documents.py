@@ -23,6 +23,7 @@ from app.core.exceptions import AppException
 from app.core.security import Principal
 from app.repositories.document_repo import DocumentRepository
 from app.schemas.documents import (
+    DeleteDocumentResponse,
     DocumentItem,
     DocumentListResponse,
     TaskStatusResponse,
@@ -107,3 +108,20 @@ async def list_documents(
         for d in docs
     ]
     return DocumentListResponse(documents=items, total=len(items))
+
+
+@router.delete(
+    "/documents/{document_id}",
+    response_model=DeleteDocumentResponse,
+    summary="删除文档（向量 + 物理副本 + 登记记录）",
+)
+async def delete_document(
+    document_id: int,
+    principal: Principal = Depends(get_principal),
+    svc: IngestionService = Depends(get_ingestion_service),
+) -> DeleteDocumentResponse:
+    """按 document_id 删除：清 Qdrant 向量 → 删知识库物理副本 → 删 PG 登记行。
+
+    带租户 ACL：只能删本租户文档，跨租户/不存在均回 404。
+    """
+    return DeleteDocumentResponse(**await svc.delete_document(document_id, principal.tenant_id))

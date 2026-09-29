@@ -150,3 +150,59 @@ async def test_get_status_unknown_task_raises():
     svc = IngestionService(db.sessionmaker, FakeArqPool())
     with pytest.raises(NotFoundError):
         await svc.get_status("00000000000000000000000000000000")
+
+
+async def test_delete_document_removes_record_and_cleanup(monkeypatch):
+    """删除文档：先清向量/物理副本，再删 PG 行；登记行确认消失。"""
+    from app.services import ingestion_service as isvc
+
+    calls: List[Any] = []
+    monkeypatch.setattr(isvc, "_clear_source_vectors", lambda src: calls.append(("vec", src)) or True)
+    monkeypatch.setattr(isvc, "_remove_physical_file", lambda src: calls.append(("file", src)) or False)
+
+    async with db.sessionmaker() as s:
+        doc, _ = await DocumentRepository(s).upsert(
+            source="to_delete.md", file_hash="hash_del_1", fmt="md",
+            tenant_id="t_del", status="ready", chunk_count=3,
+        )
+        await s.commit()
+        doc_id = doc.id
+
+    svc = IngestionService(db.sessionmaker, FakeArqPool())
+    result = await svc.delete_document(doc_id, "t_del")
+
+    assert result["deleted_id"] == doc_id and result["source"] == "to_delete.md"
+    assert result["vectors_cleared"] is True
+    # 向量与物理副本均按 source 被清理
+    assert ("vec", "to_delete.md") in calls and ("file", "to_delete.md") in calls
+    async with db.sessionmaker() as s:
+        assert await DocumentRepository(s).get_by_id(doc_id, None) is None
+
+
+async def test_delete_document_wrong_tenant_not_found(monkeypatch):
+    """跨租户删除视为不存在（NotFoundError），且不动原登记行。"""
+    from app.core.exceptions import NotFoundError
+    from app.services import ingestion_service as isvc
+
+    monkeypatch.setattr(isvc, "_clear_source_vectors", lambda src: True)
+    monkeypatch.setattr(isvc, "_remove_physical_file", lambda src: False)
+
+    async with db.sessionmaker() as s:
+        doc, _ = await DocumentRepository(s).upsert(
+            source="owned_by_a.md", file_hash="hash_own_a", fmt="md",
+            tenant_id="t_a_only", status="ready", chunk_count=1,
+        )
+        await s.commit()
+        doc_id = doc.id
+
+    svc = IngestionService(db.sessionmaker, FakeArqPool())
+    try:
+        with pytest.raises(NotFoundError):
+            await svc.delete_document(doc_id, "t_b_other")
+        # 归属校验失败不应误删
+        async with db.sessionmaker() as s:
+            assert await DocumentRepository(s).get_by_id(doc_id, "t_a_only") is not None
+    finally:
+        async with db.sessionmaker() as s:
+            await s.execute(delete(Document).where(Document.id == doc_id))
+            await s.commit()

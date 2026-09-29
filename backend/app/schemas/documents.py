@@ -33,3 +33,11 @@ class DocumentItem(BaseModel):
 class DocumentListResponse(BaseModel):
     documents: List[DocumentItem]
     total: int
+
+
+class DeleteDocumentResponse(BaseModel):
+    deleted_id: int
+    source: str
+    vectors_cleared: bool = Field(..., description="是否已向 Qdrant 提交该文件的向量删除")
+    file_removed: bool = Field(..., description="是否删除了知识库中的物理副本")
+    message: str = "文档已删除（向量、物理副本与登记记录均已清理）"

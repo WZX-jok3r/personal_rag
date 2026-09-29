@@ -19,6 +19,7 @@ const uploading = ref(false);
 const error = ref("");
 const tasks = ref<Task[]>([]);
 const docs = ref<DocumentItem[]>([]);
+const deletingId = ref<number | null>(null);
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -30,6 +31,26 @@ async function refreshDocs() {
     docs.value = res.documents;
   } catch {
     // 列表失败不阻断上传功能
+  }
+}
+
+async function onDelete(d: DocumentItem) {
+  if (deletingId.value !== null) return;
+  const ok = window.confirm(
+    `确认删除《${d.source}》？\n将同时清理其向量与知识库物理副本，不可恢复。`,
+  );
+  if (!ok) return;
+  deletingId.value = d.id;
+  error.value = "";
+  try {
+    const res = await api.deleteDocument(d.id);
+    await refreshDocs();
+    // 若刚删的文档仍在本轮任务列表里（document_id 匹配），保留任务行仅供回看
+    void res;
+  } catch (e) {
+    error.value = (e as Error).message;
+  } finally {
+    deletingId.value = null;
   }
 }
 
@@ -161,8 +182,13 @@ function badgeClass(status: string) {
         <p v-if="docs.length === 0" class="empty">暂无文档</p>
         <ul>
           <li v-for="d in docs" :key="d.id" class="doc">
-            <span class="fname">{{ d.source }}</span>
-            <span class="dim">{{ d.format }} · {{ d.chunk_count }} 块 · {{ d.status }}</span>
+            <div class="doc-main">
+              <span class="fname">{{ d.source }}</span>
+              <span class="dim">{{ d.format }} · {{ d.chunk_count }} 块 · {{ d.status }}</span>
+            </div>
+            <button class="del" :disabled="deletingId === d.id" @click="onDelete(d)">
+              {{ deletingId === d.id ? "删除中…" : "删除" }}
+            </button>
           </li>
         </ul>
       </section>
@@ -341,11 +367,39 @@ ul {
 
 .doc {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
   padding: 8px 10px;
   border-radius: 10px;
   background: rgba(30, 41, 59, 0.4);
+}
+
+.doc-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.del {
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  background: rgba(239, 68, 68, 0.12);
+  color: var(--danger);
+  border-radius: 8px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.del:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.24);
+}
+
+.del:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .dim {

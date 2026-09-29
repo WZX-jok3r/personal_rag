@@ -97,3 +97,12 @@ export interface DocumentListResponse {
   documents: DocumentItem[];
   total: number;
 }
+
+/** DELETE /api/documents/{id} 删除响应 */
+export interface DeleteDocumentResponse {
+  deleted_id: number;
+  source: string;
+  vectors_cleared: boolean;
+  file_removed: boolean;
+  message?: string;
+}

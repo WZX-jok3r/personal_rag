@@ -4,6 +4,7 @@
 import type {
   ChatRequest,
   ChatResponse,
+  DeleteDocumentResponse,
   DocumentListResponse,
   HealthInfo,
   IngestTaskStatus,
@@ -15,17 +16,33 @@ import type {
 } from "./types";
 
 const BASE = "/api/v1";
+const KEY_STORAGE = "rag_api_key";
 
-// API Key：优先取构建时环境变量 VITE_RAG_API_KEY，其次 localStorage（便于运行时手动填入）。
-// 后端开启鉴权（配置了 RAG_TENANT_KEYS）时必须携带，否则 401。
-function getApiKey(): string {
-  const envKey = (import.meta as any).env?.VITE_RAG_API_KEY as string | undefined;
-  if (envKey) return envKey;
+// API Key 读取优先级：运行时 localStorage（前端“租户 Key”设置框写入，便于随时切换租户）
+// 高于构建期 VITE_RAG_API_KEY。后端开启鉴权（配置了 RAG_TENANT_KEYS）时必须携带，否则 401。
+export function getApiKey(): string {
   try {
-    return localStorage.getItem("rag_api_key") || "";
+    const stored = localStorage.getItem(KEY_STORAGE);
+    if (stored) return stored;
   } catch {
-    return "";
+    // localStorage 不可用时回退到构建期变量
   }
+  return ((import.meta as any).env?.VITE_RAG_API_KEY as string | undefined) || "";
+}
+
+/** 运行时写入/更新 API Key（空串视为清除） */
+export function setApiKey(key: string): void {
+  try {
+    if (key) localStorage.setItem(KEY_STORAGE, key);
+    else localStorage.removeItem(KEY_STORAGE);
+  } catch {
+    // ignore
+  }
+}
+
+/** 清除已保存的 API Key */
+export function clearApiKey(): void {
+  setApiKey("");
 }
 
 /** 从非 2xx 响应中提取可读错误信息。
@@ -175,4 +192,9 @@ export function getIngestStatus(taskId: string): Promise<IngestTaskStatus> {
 /** 列出当前租户已登记文档 */
 export function listDocuments(): Promise<DocumentListResponse> {
   return request<DocumentListResponse>("/documents");
+}
+
+/** 删除文档：同时清理 Qdrant 向量 + 物理副本 + 登记记录（带租户 ACL） */
+export function deleteDocument(documentId: number): Promise<DeleteDocumentResponse> {
+  return request<DeleteDocumentResponse>(`/documents/${documentId}`, { method: "DELETE" });
 }

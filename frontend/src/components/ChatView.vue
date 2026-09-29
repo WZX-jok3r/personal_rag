@@ -4,206 +4,612 @@ import { useChatStore } from "../stores/chat";
 import MessageBubble from "./MessageBubble.vue";
 
 const chat = useChatStore();
+
 const input = ref("");
 const listEl = ref<HTMLElement | null>(null);
 
-// 已经开始流出内容（有 streaming 消息且非空）时，隐藏“正在思考…”占位点
 const streamingActive = computed(() =>
   chat.messages.some((m) => m.streaming && m.content.length > 0)
 );
+
 
 onMounted(() => {
   chat.ensureSession();
 });
 
-// 新消息或加载态变化时自动滚到底部
+
 watch(
   () => [chat.messages.length, chat.status],
   async () => {
     await nextTick();
-    if (listEl.value) listEl.value.scrollTop = listEl.value.scrollHeight;
+
+    if (listEl.value) {
+      listEl.value.scrollTop = listEl.value.scrollHeight;
+    }
   }
 );
 
+
 async function onSend() {
   const text = input.value;
+
   if (!text.trim() || chat.isLoading) return;
+
   input.value = "";
+
   await chat.sendMessageStream(text);
 }
+
 
 function onStop() {
   chat.stopStream();
 }
 
+
 async function onNewSession() {
   await chat.resetSession();
 }
+
 </script>
 
+
 <template>
-  <section class="chat-view">
-    <div ref="listEl" class="message-list">
-      <p v-if="chat.messages.length === 0 && !chat.isLoading" class="empty-hint">
-        输入问题开始对话，回答会引用知识库来源。
+
+<section class="chat-view">
+
+
+  <!-- 消息区域 -->
+  <div ref="listEl" class="message-list">
+
+
+    <!-- 欢迎页 -->
+    <div
+      v-if="chat.messages.length === 0 && !chat.isLoading"
+      class="welcome"
+    >
+
+      <div class="welcome-icon">
+        🧠
+      </div>
+
+      <h2>
+        Personal RAG Assistant
+      </h2>
+
+      <p>
+        基于你的个人知识库进行智能问答
       </p>
-      <MessageBubble
-        v-for="(m, i) in chat.messages"
-        :key="i"
-        :role="m.role"
-        :content="m.content"
-        :sources="m.sources"
-        :hidden-count="m.hiddenCount"
-        :streaming="m.streaming"
+
+
+      <div class="suggestions">
+
+        <div class="suggestion">
+          📚 查询知识库内容
+        </div>
+
+        <div class="suggestion">
+          💡 总结上传文档
+        </div>
+
+        <div class="suggestion">
+          🔍 查找相关资料
+        </div>
+
+      </div>
+
+    </div>
+
+
+
+    <!-- 消息 -->
+    <MessageBubble
+      v-for="(m,i) in chat.messages"
+      :key="i"
+      :role="m.role"
+      :content="m.content"
+      :sources="m.sources"
+      :hidden-count="m.hiddenCount"
+      :streaming="m.streaming"
+    />
+
+
+
+    <!-- 思考动画 -->
+    <div
+      v-if="chat.isLoading && !streamingActive"
+      class="thinking"
+    >
+
+      <div class="thinking-avatar">
+        🤖
+      </div>
+
+
+      <div class="thinking-box">
+
+        <span></span>
+        <span></span>
+        <span></span>
+
+        <em>
+          AI 正在检索知识库...
+        </em>
+
+      </div>
+
+    </div>
+
+
+  </div>
+
+
+
+
+  <!-- 错误 -->
+  <div
+    v-if="chat.error"
+    class="error-bar"
+  >
+    {{ chat.error }}
+  </div>
+
+
+
+
+  <!-- 输入区域 -->
+  <div class="composer">
+
+
+    <div class="composer-tools">
+
+
+      <div class="topk">
+
+        <span>
+          🔎 Recall Top-K
+        </span>
+
+
+        <input
+          v-model.number="chat.topK"
+          type="range"
+          min="1"
+          max="20"
+          step="1"
+        />
+
+
+        <strong>
+          {{ chat.topK }}
+        </strong>
+
+      </div>
+
+
+
+      <button
+        class="new-session"
+        @click="onNewSession"
+      >
+        ＋ 新会话
+      </button>
+
+
+    </div>
+
+
+
+
+    <div class="input-box">
+
+
+      <textarea
+        v-model="input"
+        rows="2"
+        placeholder="输入你的问题..."
+        @keydown.enter.exact.prevent="onSend"
       />
-      <div v-if="chat.isLoading && !streamingActive" class="loading-row">
-        <span class="dot"></span><span class="dot"></span><span class="dot"></span>
-        <em>正在思考…</em>
-      </div>
+
+
+      <button
+        v-if="!chat.isLoading"
+        class="send"
+        :disabled="!input.trim()"
+        @click="onSend"
+      >
+        🚀
+      </button>
+
+
+      <button
+        v-else
+        class="stop"
+        @click="onStop"
+      >
+        ■
+      </button>
+
+
     </div>
 
-    <div v-if="chat.error" class="error-bar">{{ chat.error }}</div>
 
-    <div class="composer">
-      <div class="composer-top">
-        <label class="topk">
-          召回 Top-K
-          <input v-model.number="chat.topK" type="range" min="1" max="20" step="1" />
-          <b>{{ chat.topK }}</b>
-        </label>
-        <button class="btn-ghost" @click="onNewSession">＋ 新会话</button>
-      </div>
-      <div class="composer-input">
-        <textarea
-          v-model="input"
-          rows="2"
-          placeholder="请输入您的问题，回车发送（Shift+Enter 换行）"
-          @keydown.enter.exact.prevent="onSend"
-        ></textarea>
-        <button v-if="!chat.isLoading" class="btn-primary" :disabled="!input.trim()" @click="onSend">
-          发送
-        </button>
-        <button v-else class="btn-stop" @click="onStop">停止</button>
-      </div>
-    </div>
-  </section>
+  </div>
+
+
+
+</section>
+
 </template>
 
+
+
 <style scoped>
+
 .chat-view {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  min-height: 0;
+
+height:100%;
+
+display:flex;
+
+flex-direction:column;
+
 }
+
+
 
 .message-list {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding: 20px;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
+
+flex:1;
+
+overflow-y:auto;
+
+padding:32px;
+
+display:flex;
+
+flex-direction:column;
+
+gap:18px;
+
 }
 
-.empty-hint {
-  color: var(--muted);
-  text-align: center;
-  margin-top: 40px;
+
+
+/* 欢迎区域 */
+
+.welcome {
+
+margin:auto;
+
+text-align:center;
+
+color:var(--muted);
+
 }
 
-.loading-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--muted);
-  font-size: 13px;
+
+
+.welcome-icon {
+
+font-size:52px;
+
+margin-bottom:15px;
+
 }
 
-.dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--muted);
-  animation: blink 1.2s infinite ease-in-out;
-}
-.dot:nth-child(2) { animation-delay: 0.2s; }
-.dot:nth-child(3) { animation-delay: 0.4s; }
 
-@keyframes blink {
-  0%, 80%, 100% { opacity: 0.2; }
-  40% { opacity: 1; }
+
+.welcome h2 {
+
+font-size:26px;
+
+color:var(--fg);
+
+margin-bottom:10px;
+
 }
+
+
+
+.welcome p {
+
+font-size:15px;
+
+}
+
+
+
+.suggestions {
+
+display:flex;
+
+gap:12px;
+
+margin-top:30px;
+
+justify-content:center;
+
+}
+
+
+
+.suggestion {
+
+padding:12px 18px;
+
+background:rgba(255,255,255,.08);
+
+border:1px solid var(--border);
+
+border-radius:18px;
+
+font-size:13px;
+
+}
+
+
+
+
+/* AI思考 */
+
+.thinking {
+
+display:flex;
+
+gap:12px;
+
+align-items:center;
+
+}
+
+
+
+.thinking-avatar {
+
+font-size:28px;
+
+}
+
+
+
+.thinking-box {
+
+padding:12px 18px;
+
+border-radius:18px;
+
+background:var(--card);
+
+display:flex;
+
+align-items:center;
+
+gap:6px;
+
+}
+
+
+
+.thinking-box span {
+
+width:6px;
+
+height:6px;
+
+background:var(--primary);
+
+border-radius:50%;
+
+animation:pulse 1s infinite;
+
+}
+
+
+
+.thinking-box span:nth-child(2){
+
+animation-delay:.2s;
+
+}
+
+
+.thinking-box span:nth-child(3){
+
+animation-delay:.4s;
+
+}
+
+
+@keyframes pulse {
+
+50%{
+
+opacity:.2;
+
+}
+
+}
+
+
+
+.thinking-box em {
+
+font-style:normal;
+
+font-size:13px;
+
+color:var(--muted);
+
+}
+
+
+
 
 .error-bar {
-  background: #fef2f2;
-  color: var(--danger);
-  padding: 8px 20px;
-  font-size: 13px;
-  border-top: 1px solid #fecaca;
+
+padding:10px 20px;
+
+background:#fee2e2;
+
+color:#dc2626;
+
 }
+
+
+
 
 .composer {
-  border-top: 1px solid var(--border);
-  padding: 10px 20px 16px;
-  background: #fff;
+
+padding:15px 25px 25px;
+
+border-top:1px solid var(--border);
+
+background:rgba(0,0,0,.15);
+
 }
 
-.composer-top {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 8px;
+
+
+.composer-tools {
+
+display:flex;
+
+justify-content:space-between;
+
+align-items:center;
+
+margin-bottom:12px;
+
 }
+
+
 
 .topk {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  color: var(--muted);
-}
-.topk input[type="range"] {
-  width: 120px;
-}
-.topk b {
-  color: var(--fg);
-  min-width: 18px;
-  text-align: center;
+
+display:flex;
+
+align-items:center;
+
+gap:10px;
+
+font-size:13px;
+
 }
 
-.composer-input {
-  display: flex;
-  gap: 10px;
-  align-items: flex-end;
+
+
+.topk input {
+
+width:120px;
+
 }
 
-.composer-input textarea {
-  flex: 1;
-  resize: vertical;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 10px 12px;
-  font-size: 14px;
-  font-family: inherit;
-}
-.composer-input textarea:focus {
-  outline: none;
-  border-color: var(--primary);
+
+
+.topk strong {
+
+min-width:25px;
+
 }
 
-.btn-stop {
-  flex: 0 0 auto;
-  padding: 0 18px;
-  border: 1px solid var(--danger);
-  background: #fff;
-  color: var(--danger);
-  border-radius: var(--radius);
-  font-size: 14px;
-  cursor: pointer;
+
+
+.new-session {
+
+border:1px solid var(--border);
+
+background:transparent;
+
+padding:8px 15px;
+
+border-radius:12px;
+
+cursor:pointer;
+
 }
-.btn-stop:hover {
-  background: #fef2f2;
+
+
+
+.input-box {
+
+display:flex;
+
+gap:12px;
+
+background:var(--card);
+
+padding:10px;
+
+border-radius:20px;
+
+border:1px solid var(--border);
+
 }
+
+
+
+textarea {
+
+flex:1;
+
+resize:none;
+
+background:transparent;
+
+border:none;
+
+outline:none;
+
+font-size:15px;
+
+}
+
+
+
+.send,
+.stop {
+
+width:46px;
+
+height:46px;
+
+border-radius:50%;
+
+border:none;
+
+cursor:pointer;
+
+font-size:18px;
+
+}
+
+
+
+.send {
+
+background:var(--primary);
+
+color:white;
+
+}
+
+
+
+.send:disabled {
+
+opacity:.4;
+
+}
+
+
+
+.stop {
+
+background:#ef4444;
+
+color:white;
+
+}
+
+
 </style>

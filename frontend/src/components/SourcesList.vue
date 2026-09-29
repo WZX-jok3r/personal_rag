@@ -1,93 +1,275 @@
 <script setup lang="ts">
-import { ref } from "vue";
-import type { SourceItem } from "../api/types";
 
-defineProps<{ sources?: SourceItem[]; hiddenCount?: number }>();
+defineProps<{
+  sources: any[];
+}>();
 
-// 默认折叠，点击展开查看引用片段
-const open = ref(false);
+
+function getTitle(item:any){
+
+  return (
+    item.title ||
+    item.filename ||
+    item.file_name ||
+    "Knowledge Document"
+  );
+
+}
+
+
+function getScore(item:any){
+
+  const score =
+    item.score ??
+    item.similarity ??
+    item.distance;
+
+
+  if(score === undefined){
+    return null;
+  }
+
+
+  if(typeof score === "number"){
+    return score.toFixed(3);
+  }
+
+
+  return score;
+
+}
+
 </script>
 
+
+
 <template>
-  <div v-if="(sources && sources.length) || hiddenCount" class="sources">
-    <button class="sources-toggle" @click="open = !open">
-      📚 参考资料 {{ sources?.length || 0 }} 条
-      <span v-if="hiddenCount" class="hidden-badge" title="被低相关过滤阈值隐藏">🙈 已隐藏 {{ hiddenCount }} 条</span>
-      {{ open ? "▲" : "▼" }}
-    </button>
-    <ol v-show="open" class="sources-list">
-      <li v-for="(s, i) in sources" :key="i" class="source-item">
-        <div class="source-head">
-          <b>[{{ i + 1 }}]</b>
-          <code>{{ s.source }}</code>
-          <span class="fmt">({{ s.format }})</span>
-          <span class="score">score: {{ s.score }}</span>
-        </div>
-        <p v-if="s.text_preview" class="preview">{{ s.text_preview }}</p>
-      </li>
-    </ol>
+
+<div class="sources">
+
+
+  <div class="sources-title">
+
+    📚 Knowledge Sources
+
   </div>
+
+
+
+  <div
+    class="source-list"
+  >
+
+
+    <div
+      v-for="(item,index) in sources"
+      :key="index"
+      class="source-card"
+    >
+
+
+      <div class="source-icon">
+        📄
+      </div>
+
+
+
+      <div class="source-body">
+
+
+        <div class="source-name">
+
+          {{ getTitle(item) }}
+
+        </div>
+
+
+
+        <div
+          v-if="getScore(item)"
+          class="score"
+        >
+
+          Similarity:
+          {{ getScore(item) }}
+
+        </div>
+
+
+
+        <div
+          v-if="item.content || item.text"
+          class="excerpt"
+        >
+
+          {{
+            item.content ||
+            item.text
+          }}
+
+        </div>
+
+
+
+      </div>
+
+
+
+    </div>
+
+
+  </div>
+
+
+
+</div>
+
+
 </template>
 
+
+
 <style scoped>
+
+
 .sources {
-  margin-top: 8px;
-  border-top: 1px dashed var(--border);
-  padding-top: 6px;
+
+margin-top:18px;
+
+padding-top:15px;
+
+border-top:1px solid var(--border);
+
 }
 
-.sources-toggle {
-  background: transparent;
-  color: var(--muted);
-  font-size: 12px;
-  padding: 2px 0;
+
+
+.sources-title {
+
+font-size:13px;
+
+font-weight:600;
+
+color:var(--muted);
+
+margin-bottom:12px;
+
 }
 
-.hidden-badge {
-  display: inline-block;
-  background: #fef3c7;
-  color: #92400e;
-  border: 1px solid #fde68a;
-  border-radius: 9999px;
-  padding: 0 8px;
-  margin: 0 4px;
-  font-size: 11px;
+
+
+.source-list {
+
+display:flex;
+
+flex-direction:column;
+
+gap:10px;
+
 }
 
-.sources-list {
-  margin: 8px 0 0;
-  padding-left: 18px;
-  font-size: 12px;
-  color: var(--fg);
+
+
+.source-card {
+
+
+display:flex;
+
+gap:12px;
+
+padding:12px;
+
+border-radius:14px;
+
+background:
+rgba(255,255,255,.04);
+
+border:1px solid var(--border);
+
+transition:.2s;
+
 }
 
-.source-item {
-  margin-bottom: 8px;
+
+
+.source-card:hover {
+
+transform:translateY(-2px);
+
+border-color:var(--primary);
+
 }
 
-.source-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
+
+
+.source-icon {
+
+font-size:22px;
+
 }
 
-.source-head code {
-  background: #f0f2f5;
-  padding: 1px 6px;
-  border-radius: 4px;
+
+
+.source-body {
+
+flex:1;
+
+min-width:0;
+
 }
 
-.fmt,
+
+
+.source-name {
+
+font-size:14px;
+
+font-weight:600;
+
+margin-bottom:5px;
+
+}
+
+
+
 .score {
-  color: var(--muted);
+
+display:inline-block;
+
+font-size:12px;
+
+padding:3px 8px;
+
+border-radius:10px;
+
+background:rgba(37,99,235,.15);
+
+color:#60a5fa;
+
+margin-bottom:8px;
+
 }
 
-.preview {
-  margin: 4px 0 0;
-  color: var(--muted);
-  border-left: 2px solid var(--border);
-  padding-left: 8px;
-  white-space: pre-wrap;
+
+
+.excerpt {
+
+
+font-size:13px;
+
+line-height:1.5;
+
+color:var(--muted);
+
+display:-webkit-box;
+
+-webkit-line-clamp:3;
+
+-webkit-box-orient:vertical;
+
+overflow:hidden;
+
 }
+
+
 </style>

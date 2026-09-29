@@ -16,6 +16,17 @@ export interface ChatMessage {
 }
 
 const SESSION_KEY = "rag_session_id";
+// 会话归属租户的指纹（与 session 一同存储）：Key 变更后据此丢弃旧会话，避免跨租户串会话
+const SESSION_TENANT_KEY = "rag_session_tenant";
+
+/** 当前 API Key 的轻量非可逆指纹（djb2）；空 Key 返回空串 */
+function keyFingerprint(): string {
+  const k = api.getApiKey();
+  if (!k) return "";
+  let h = 5381;
+  for (let i = 0; i < k.length; i++) h = ((h << 5) + h + k.charCodeAt(i)) >>> 0;
+  return h.toString(16);
+}
 
 // 当前进行中的流式请求控制器（不入 state，避免被响应式代理包裹）
 let currentAbort: AbortController | null = null;
@@ -35,28 +46,37 @@ export const useChatStore = defineStore("chat", {
   },
 
   actions: {
-    /** 进入页面：优先复用 localStorage 里的 session，否则惰性新建 */
+    /** 进入页面：仅当本地 session 与当前租户指纹一致才复用，否则新建（防跨租户串会话） */
     async ensureSession() {
       if (this.initialized) return;
       const saved = localStorage.getItem(SESSION_KEY);
-      if (saved) {
+      const savedTenant = localStorage.getItem(SESSION_TENANT_KEY);
+      if (saved && savedTenant === keyFingerprint()) {
         this.sessionId = saved;
       } else {
+        // 无会话或已切换租户：清掉残留旧 id，避免沿用别的租户的会话
+        localStorage.removeItem(SESSION_KEY);
+        localStorage.removeItem(SESSION_TENANT_KEY);
         await this.createNewSession();
       }
       this.initialized = true;
     },
 
-    /** 新建后端会话并写入 localStorage */
+    /** 新建后端会话并写入 localStorage（连同当前租户指纹） */
     async createNewSession() {
       try {
         const res = await api.createSession();
         this.sessionId = res.session_id;
         localStorage.setItem(SESSION_KEY, res.session_id);
+        localStorage.setItem(SESSION_TENANT_KEY, keyFingerprint());
         this.messages = [];
         this.error = "";
         this.status = "idle";
       } catch (e) {
+        // 新建失败（如 Key 无效 401）：清掉可能残留的旧会话，修正 Key 后可干净重建
+        localStorage.removeItem(SESSION_KEY);
+        localStorage.removeItem(SESSION_TENANT_KEY);
+        this.sessionId = null;
         this.status = "error";
         this.error = `新建会话失败: ${(e as Error).message}`;
       }
@@ -186,6 +206,7 @@ export const useChatStore = defineStore("chat", {
         }
       }
       localStorage.removeItem(SESSION_KEY);
+      localStorage.removeItem(SESSION_TENANT_KEY);
       this.sessionId = null;
       this.messages = [];
       this.error = "";

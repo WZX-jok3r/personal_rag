@@ -198,3 +198,13 @@ export function listDocuments(): Promise<DocumentListResponse> {
 export function deleteDocument(documentId: number): Promise<DeleteDocumentResponse> {
   return request<DeleteDocumentResponse>(`/documents/${documentId}`, { method: "DELETE" });
 }
+
+/** 校验当前生效的 API Key 是否合法：用一次轻量鉴权请求（列文档）探测，401/异常返回 false。 */
+export async function verifyApiKey(): Promise<boolean> {
+  try {
+    await listDocuments();
+    return true;
+  } catch {
+    return false;
+  }
+}

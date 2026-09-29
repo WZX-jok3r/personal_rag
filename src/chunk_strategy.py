@@ -706,20 +706,24 @@ def chunk_docx(documents: List[Dict[str, Any]], chunk_size: int = DEFAULT_CHUNK_
 def chunk_xlsx(documents: List[Dict[str, Any]], chunk_size: int = DEFAULT_CHUNK_SIZE,
                overlap: int = DEFAULT_CHUNK_OVERLAP) -> List[Chunk]:
     """
-    XLSX 分块策略（v6 修复缺陷3：sheet 级 Markdown 大表走表格感知切分）
+    XLSX 分块策略（v7 补行级语义化，与 docx/md 表格策略对齐）
     - openpyxl 路径: 每个 sheet 是一张完整 Markdown 表格(type=sheet)
         ≤ chunk_size → 整表保留(xlsx_table_whole, is_table=True)
         > chunk_size → split_markdown_table 按行切分，每子块自带表头(xlsx_table_row_split)
-        （与 docx/md 表格策略对齐，替代原先破坏行列结构的字符级切分）
+        两种情况都会额外产出 table_rows_to_sentences 行级语义句块(table_row_sentence)
+        （长表行数>MAX_ROW_SENTENCE_ROWS 自动跳过，避免 chunk 爆炸）
     - pandas 降级路径: 每行独立 Document("表头: ... 数据: ...")，保持原有按大小切分
     """
     logger.info(f"[XLSX] 分块: {documents[0]['metadata'].get('source', 'unknown') if documents else 'unknown'}")
     chunks = []
+    table_counter = 0  # 为行组块/行级句块生成稳定的 table_id
     for doc in documents:
         text = doc["text"]
         meta = doc["metadata"]
         if is_markdown_table(text):
             # sheet 级 Markdown 表格：走表格感知切分
+            table_counter += 1
+            table_id = f"xtbl_{table_counter}"
             if len(text) > chunk_size:
                 sub_tables = split_markdown_table(text, max_rows_per_chunk=15)
                 for j, sub in enumerate(sub_tables):
@@ -727,13 +731,25 @@ def chunk_xlsx(documents: List[Dict[str, Any]], chunk_size: int = DEFAULT_CHUNK_
                         text=sub,
                         metadata={**meta, "chunk_index": len(chunks), "sub_index": j,
                                   "strategy": "xlsx_table_row_split", "is_table": True,
+                                  "table_id": table_id, "parent_id": table_id,
                                   "total_sub_chunks": len(sub_tables)}
                     ))
             else:
                 chunks.append(Chunk(
                     text=text,
                     metadata={**meta, "chunk_index": len(chunks),
-                              "strategy": "xlsx_table_whole", "is_table": True}
+                              "strategy": "xlsx_table_whole", "is_table": True,
+                              "table_id": table_id, "is_parent": True}
+                ))
+            # 行级语义化（additive）：逐行生成"列名 为 值"整句，与行组块并存；
+            # 让"以任一列值查同行其它列"的 lookup 能被 hybrid+rerank 稳定命中
+            for rs in table_rows_to_sentences(text):
+                chunks.append(Chunk(
+                    text=rs["text"],
+                    metadata={**meta, "chunk_index": len(chunks), "sub_index": rs["row_index"],
+                              "strategy": "table_row_sentence", "is_table": True,
+                              "table_id": table_id, "parent_id": table_id,
+                              "is_parent": False, "row_index": rs["row_index"]}
                 ))
         elif len(text) <= chunk_size:
             chunks.append(Chunk(text=text, metadata={**meta, "chunk_index": len(chunks), "strategy": "xlsx_row"}))

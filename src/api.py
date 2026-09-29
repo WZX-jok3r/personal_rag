@@ -21,6 +21,7 @@ api.py - FastAPI 后端服务（前后端分离的"后端"）
 
 import time
 import uuid
+import json
 import logging
 import threading
 from contextlib import asynccontextmanager
@@ -28,7 +29,7 @@ from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from config import (
@@ -295,6 +296,43 @@ def chat_query(req: ChatRequest, principal: Principal = Depends(require_principa
         retrieved_count=result["retrieved_count"],
         history_length=len(_sessions.get_history(session_id)),
         hidden_count=result.get("hidden_count", 0),
+    )
+
+
+@app.post("/api/chat/stream", summary="多轮对话（SSE 流式）")
+def chat_stream(req: ChatRequest, principal: Principal = Depends(require_principal)):
+    """基于 SSE 的逐 token 流式多轮对话（供 Vue SPA 调用）。
+    事件流：meta(来沉/隐藏数) -> delta(多个) -> done/error；会话落库在 done 时进。"""
+    if req.session_id and _sessions.exists(req.session_id):
+        session_id = req.session_id
+    else:
+        session_id = _sessions.create()
+
+    # 取“进入前”的历史作为上下文（不含本轮 user），与非流式语义一致；随后先把 user 落库
+    history = _sessions.get_history(session_id)
+    _sessions.append(session_id, {"role": "user", "content": req.message})
+
+    pipeline = get_global_pipeline()
+    filter_dict = _enforced_filter(None, principal)
+    top_k = _resolve_top_k(req.top_k)
+
+    def event_gen():
+        try:
+            for ev in pipeline.stream_chat(req.message, history, top_k=top_k, filter_dict=filter_dict):
+                if ev.get("type") == "done":
+                    _sessions.append(session_id, {"role": "assistant", "content": ev["answer"]})
+                    ev["session_id"] = session_id
+                    ev["history_length"] = len(_sessions.get_history(session_id))
+                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            logger.error(f"[API] 流式对话出错: {e}")
+            err = {"type": "error", "message": f"处理出错: {e}"}
+            yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
 
 

@@ -12,9 +12,13 @@ export interface ChatMessage {
   content: string;
   sources?: SourceItem[];
   hiddenCount?: number;
+  streaming?: boolean;
 }
 
 const SESSION_KEY = "rag_session_id";
+
+// 当前进行中的流式请求控制器（不入 state，避免被响应式代理包裹）
+let currentAbort: AbortController | null = null;
 
 export const useChatStore = defineStore("chat", {
   state: () => ({
@@ -95,8 +99,85 @@ export const useChatStore = defineStore("chat", {
       }
     },
 
+    /** 发送一条消息（流式 SSE）：逐段增量渲染 assistant 消息 */
+    async sendMessageStream(text: string) {
+      const message = text.trim();
+      if (!message || this.isLoading) return;
+
+      await this.ensureSession();
+      this.status = "loading";
+      this.error = "";
+      this.messages.push({ role: "user", content: message });
+      // 先放一条空的 assistant 占位消息，后续就地累加
+      this.messages.push({
+        role: "assistant",
+        content: "",
+        sources: [],
+        hiddenCount: 0,
+        streaming: true,
+      });
+      const idx = this.messages.length - 1;
+
+      currentAbort?.abort();
+      const controller = new AbortController();
+      currentAbort = controller;
+      let hadError = false;
+
+      try {
+        await api.chatStream(
+          { message, session_id: this.sessionId, top_k: this.topK },
+          (ev) => {
+            const msg = this.messages[idx];
+            if (ev.type === "meta") {
+              msg.sources = ev.sources;
+              msg.hiddenCount = ev.hidden_count;
+            } else if (ev.type === "delta") {
+              msg.content += ev.text;
+            } else if (ev.type === "done") {
+              if (ev.answer) msg.content = ev.answer;
+              msg.streaming = false;
+              if (ev.session_id && ev.session_id !== this.sessionId) {
+                this.sessionId = ev.session_id;
+                localStorage.setItem(SESSION_KEY, ev.session_id);
+              }
+            } else if (ev.type === "error") {
+              msg.streaming = false;
+              hadError = true;
+              this.status = "error";
+              this.error = ev.message;
+            }
+          },
+          controller.signal,
+        );
+        if (!hadError) this.status = "idle";
+        const m = this.messages[idx];
+        if (m) m.streaming = false;
+      } catch (e) {
+        const m = this.messages[idx];
+        if (m) m.streaming = false;
+        if ((e as Error).name === "AbortError") {
+          // 用户主动中断：保留已流出内容，不算错误
+          this.status = "idle";
+        } else {
+          this.status = "error";
+          this.error = `请求失败: ${(e as Error).message}`;
+        }
+      } finally {
+        if (currentAbort === controller) currentAbort = null;
+      }
+    },
+
+    /** 中断当前进行中的流式输出 */
+    stopStream() {
+      currentAbort?.abort();
+      currentAbort = null;
+    },
+
     /** 新会话：删除旧 session -> 清空 -> 新建 */
     async resetSession() {
+      // 若有进行中的流式请求，先中断
+      currentAbort?.abort();
+      currentAbort = null;
       if (this.sessionId) {
         try {
           await api.deleteSession(this.sessionId);

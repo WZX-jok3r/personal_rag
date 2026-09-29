@@ -46,6 +46,13 @@ export interface SessionCreated {
   session_id: string;
 }
 
+/** POST /api/chat/stream 的 SSE 事件（逐条 data: <json>） */
+export type StreamEvent =
+  | { type: "meta"; sources: SourceItem[]; retrieved_count: number; hidden_count: number }
+  | { type: "delta"; text: string }
+  | { type: "done"; answer: string; session_id?: string; history_length?: number }
+  | { type: "error"; message: string };
+
 /** GET /api/health 响应 */
 export interface HealthInfo {
   status: string;

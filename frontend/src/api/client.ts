@@ -8,6 +8,7 @@ import type {
   QueryRequest,
   QueryResponse,
   SessionCreated,
+  StreamEvent,
 } from "./types";
 
 const BASE = "/api";
@@ -71,6 +72,65 @@ export function chat(payload: ChatRequest): Promise<ChatResponse> {
     method: "POST",
     body: JSON.stringify(payload),
   });
+}
+
+/**
+ * 多轮对话的流式版本（SSE）：逐条回调 StreamEvent，支持 AbortController 外部中断。
+ * 用 fetch + ReadableStream 而非 EventSource，因为需要 POST 且能带 X-API-Key 请求头。
+ */
+export async function chatStream(
+  payload: ChatRequest,
+  onEvent: (ev: StreamEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "text/event-stream",
+  };
+  const key = getApiKey();
+  if (key) headers["X-API-Key"] = key;
+
+  const resp = await fetch(`${BASE}/chat/stream`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(payload),
+    signal,
+  });
+
+  if (!resp.ok || !resp.body) {
+    let detail = `${resp.status} ${resp.statusText}`;
+    try {
+      const err = await resp.json();
+      if (err && err.detail) detail = String(err.detail);
+    } catch {
+      // 忽略解析失败，回退到状态行
+    }
+    throw new Error(detail);
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    // 按 SSE 帧分隔符 \n\n 切分，残留不足一帧的留在 buf 中
+    let sep: number;
+    while ((sep = buf.indexOf("\n\n")) !== -1) {
+      const frame = buf.slice(0, sep);
+      buf = buf.slice(sep + 2);
+      const line = frame.split("\n").find((l) => l.startsWith("data:"));
+      if (!line) continue;
+      const jsonStr = line.slice("data:".length).trim();
+      if (!jsonStr) continue;
+      try {
+        onEvent(JSON.parse(jsonStr) as StreamEvent);
+      } catch {
+        // 忽略单帧解析异常，不中断整条流
+      }
+    }
+  }
 }
 
 /** 新建空白会话 */

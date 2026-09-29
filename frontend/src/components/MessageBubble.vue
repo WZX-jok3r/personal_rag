@@ -9,6 +9,7 @@ const props = defineProps<{
   content: string;
   sources?: SourceItem[];
   hiddenCount?: number;
+  streaming?: boolean;
 }>();
 
 // html:false 禁止内联 HTML，规避 XSS；linkify 自动识别链接
@@ -26,6 +27,7 @@ const rendered = computed(() =>
     <div class="bubble">
       <div v-if="role === 'assistant'" class="md" v-html="rendered"></div>
       <div v-else class="plain">{{ content }}</div>
+      <span v-if="role === 'assistant' && streaming" class="caret">▍</span>
       <SourcesList v-if="role === 'assistant'" :sources="sources" :hidden-count="hiddenCount" />
     </div>
   </div>
@@ -83,6 +85,18 @@ const rendered = computed(() =>
 
 .plain {
   white-space: pre-wrap;
+}
+
+.caret {
+  display: inline-block;
+  margin-left: 1px;
+  color: var(--primary);
+  animation: caret-blink 1s step-end infinite;
+}
+
+@keyframes caret-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
 }
 
 /* markdown 内容样式 */

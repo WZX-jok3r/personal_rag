@@ -1,11 +1,16 @@
 <script setup lang="ts">
-import { ref, nextTick, onMounted, watch } from "vue";
+import { ref, nextTick, onMounted, watch, computed } from "vue";
 import { useChatStore } from "../stores/chat";
 import MessageBubble from "./MessageBubble.vue";
 
 const chat = useChatStore();
 const input = ref("");
 const listEl = ref<HTMLElement | null>(null);
+
+// 已经开始流出内容（有 streaming 消息且非空）时，隐藏“正在思考…”占位点
+const streamingActive = computed(() =>
+  chat.messages.some((m) => m.streaming && m.content.length > 0)
+);
 
 onMounted(() => {
   chat.ensureSession();
@@ -24,7 +29,11 @@ async function onSend() {
   const text = input.value;
   if (!text.trim() || chat.isLoading) return;
   input.value = "";
-  await chat.sendMessage(text);
+  await chat.sendMessageStream(text);
+}
+
+function onStop() {
+  chat.stopStream();
 }
 
 async function onNewSession() {
@@ -45,8 +54,9 @@ async function onNewSession() {
         :content="m.content"
         :sources="m.sources"
         :hidden-count="m.hiddenCount"
+        :streaming="m.streaming"
       />
-      <div v-if="chat.isLoading" class="loading-row">
+      <div v-if="chat.isLoading && !streamingActive" class="loading-row">
         <span class="dot"></span><span class="dot"></span><span class="dot"></span>
         <em>正在思考…</em>
       </div>
@@ -70,9 +80,10 @@ async function onNewSession() {
           placeholder="请输入您的问题，回车发送（Shift+Enter 换行）"
           @keydown.enter.exact.prevent="onSend"
         ></textarea>
-        <button class="btn-primary" :disabled="chat.isLoading || !input.trim()" @click="onSend">
+        <button v-if="!chat.isLoading" class="btn-primary" :disabled="!input.trim()" @click="onSend">
           发送
         </button>
+        <button v-else class="btn-stop" @click="onStop">停止</button>
       </div>
     </div>
   </section>
@@ -180,5 +191,19 @@ async function onNewSession() {
 .composer-input textarea:focus {
   outline: none;
   border-color: var(--primary);
+}
+
+.btn-stop {
+  flex: 0 0 auto;
+  padding: 0 18px;
+  border: 1px solid var(--danger);
+  background: #fff;
+  color: var(--danger);
+  border-radius: var(--radius);
+  font-size: 14px;
+  cursor: pointer;
+}
+.btn-stop:hover {
+  background: #fef2f2;
 }
 </style>

@@ -18,7 +18,7 @@ rag_pipeline.py - RAG 完整链路
 
 import json
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Iterator
 
 import requests
 
@@ -109,6 +109,25 @@ class RAGPipeline:
 
         return "\n\n".join(context_parts)
 
+    def _format_sources(self, chunks: List[Dict[str, Any]], with_preview: bool = False) -> List[Dict[str, Any]]:
+        """将检索 chunks 组装成 sources 列表（query / query_with_history / stream 共用）。
+        with_preview=True 时附带正文预览。"""
+        from pathlib import Path
+        sources = []
+        for chunk in chunks:
+            meta = chunk["metadata"]
+            source_name = Path(meta.get("source", "")).name
+            item = {
+                "source": source_name,
+                "format": meta.get("format", "unknown"),
+                "score": round(chunk["score"], 4),
+            }
+            if with_preview:
+                text = chunk["text"]
+                item["text_preview"] = text[:200] + "..." if len(text) > 200 else text
+            sources.append(item)
+        return sources
+
     def _call_llm(self, system_prompt: str, user_query: str) -> str:
         """调用 SiliconFlow DeepSeek API（保持旧签名：仅返回答案文本）。
         实际请求与 usage 捕获都委派给 _do_llm_request，作为唯一埋点入口。"""
@@ -158,6 +177,99 @@ class RAGPipeline:
                 gen.update(output="抱歉，模型响应格式异常。", level="ERROR", status_message=str(e))
                 return "抱歉，模型响应格式异常，请稍后重试。", {}
 
+    def _stream_llm(self, messages: List[Dict[str, str]]) -> Iterator[str]:
+        """流式调用 SiliconFlow chat/completions（stream=True），逐段 yield 文本增量。
+        - 仅处理 `data:` 帧；`[DONE]` 终止；无 choices 的纯 usage 帧只记录不产出。
+        - 全程包在 obs.generation 下，结束时以累计全文与 usage 更新；请求异常向上抛。"""
+        url = f"{self.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+
+        with obs.generation("llm", model=self.model, input=messages) as gen:
+            parts: List[str] = []
+            usage: Dict[str, Any] = {}
+            try:
+                resp = requests.post(url, headers=headers, json=payload, timeout=120, stream=True)
+                resp.raise_for_status()
+                # SSE 帧为 UTF-8；响应头无 charset 时 iter_lines(decode_unicode=True) 会误用 latin-1，
+                # 故按字节行读取后显式以 UTF-8 解码（\n=0x0A 不会出现在 UTF-8 多字节序列中，逐行解码安全）
+                for raw in resp.iter_lines():
+                    if not raw:
+                        continue
+                    line = raw.decode("utf-8", errors="replace")
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[len("data:"):].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    if chunk.get("usage"):
+                        usage = obs.extract_usage(chunk)
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = (choices[0].get("delta") or {}).get("content")
+                    if delta:
+                        parts.append(delta)
+                        yield delta
+                gen.update(output="".join(parts).strip(), usage=usage,
+                           metadata={"model": self.model, "stream": True})
+            except requests.exceptions.RequestException as e:
+                logger.error(f"[LLM stream] 请求失败: {e}")
+                gen.update(output="".join(parts), level="ERROR", status_message=str(e))
+                raise
+
+    def stream_chat(self, query: str, history: List[Dict[str, str]],
+                    top_k: int = TOP_K, filter_dict: Optional[Dict] = None) -> Iterator[Dict[str, Any]]:
+        """流式多轮问答：依次 yield meta -> delta(多个) -> done/error 事件字典。
+        检索、低相关过滤与来源组装与非流式 query_with_history 一致，不改动。"""
+        with obs.trace("rag_chat_stream", input={"query": query, "top_k": top_k, "history_len": len(history)},
+                        metadata={"filter": filter_dict}) as tr:
+            with obs.span("retrieve", input=query) as sp:
+                chunks, dropped = self._retrieve(query, top_k=top_k, filter_dict=filter_dict)
+                sp.update(output={"retrieved_count": len(chunks), "hidden_count": dropped})
+
+            sources = self._format_sources(chunks, with_preview=False)
+            yield {"type": "meta", "sources": sources,
+                   "retrieved_count": len(chunks), "hidden_count": dropped}
+
+            if not chunks:
+                refuse = "根据现有资料，未能找到相关信息。"
+                yield {"type": "delta", "text": refuse}
+                yield {"type": "done", "answer": refuse}
+                tr.update(output=refuse, metadata={"retrieved_count": 0})
+                return
+
+            context = self._build_context(chunks)
+            messages = [{"role": "system", "content": self.SYSTEM_PROMPT.format(context=context)}]
+            messages.extend(history)
+            messages.append({"role": "user", "content": query})
+
+            parts: List[str] = []
+            try:
+                for delta in self._stream_llm(messages):
+                    parts.append(delta)
+                    yield {"type": "delta", "text": delta}
+                answer = "".join(parts).strip()
+                tr.update(output=answer, metadata={"retrieved_count": len(chunks),
+                                                   "sources": [s["source"] for s in sources]})
+                yield {"type": "done", "answer": answer}
+            except requests.exceptions.RequestException as e:
+                yield {"type": "error", "message": f"抱歉，调用模型时出错: {str(e)}"}
+
     def query(self, query: str, top_k: int = TOP_K, filter_dict: Optional[Dict] = None,
               generate: bool = True) -> Dict[str, Any]:
         """
@@ -201,17 +313,7 @@ class RAGPipeline:
                 answer = "(retrieval-only：已跳过 LLM 生成)"
 
             # 5. 格式化 sources
-            sources = []
-            for chunk in chunks:
-                meta = chunk["metadata"]
-                from pathlib import Path
-                source_name = Path(meta.get("source", "")).name
-                sources.append({
-                    "source": source_name,
-                    "format": meta.get("format", "unknown"),
-                    "score": round(chunk["score"], 4),
-                    "text_preview": chunk["text"][:200] + "..." if len(chunk["text"]) > 200 else chunk["text"],
-                })
+            sources = self._format_sources(chunks, with_preview=True)
 
             result = {
                 "query": query,
@@ -247,16 +349,7 @@ class RAGPipeline:
             # 3. 调用 LLM（统一入口，内部带 generation 埋点与 usage 捕获）
             answer, _usage = self._do_llm_request(messages)
 
-            sources = []
-            for chunk in chunks:
-                meta = chunk["metadata"]
-                from pathlib import Path
-                source_name = Path(meta.get("source", "")).name
-                sources.append({
-                    "source": source_name,
-                    "format": meta.get("format", "unknown"),
-                    "score": round(chunk["score"], 4),
-                })
+            sources = self._format_sources(chunks, with_preview=False)
 
             result = {
                 "query": query,

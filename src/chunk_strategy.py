@@ -760,6 +760,57 @@ def _strip_leading_page_markers(text: str) -> str:
     return "\n".join(lines[idx:])
 
 
+def unwrap_wrapped_table_lines(text: str) -> str:
+    """
+    修复"宽表格单元格被 PDF 提取器按视觉换行折断"导致的 Markdown 表格失真。
+
+    背景：pdfplumber / pymupdf 提取宽表（如 A3 绩效表）时，会把一个逻辑行拆成
+    多个物理行——表头 "Revenue Generated" 被折成 "... | Revenue" + "Generated | ..."，
+    数据行 "Quality Assurance" 同理。于是表格不再满足"一行一记录、行首行尾都含 |"
+    的 Markdown 约定，is_markdown_table（要求第 2 行是 |---| 分隔行）判定失败，
+    整表被 split_by_size 按字符切碎，表头与数据行分离（如 Design 部门行丢表头）。
+
+    规则（保守，只处理表格行，绝不触碰正文）:
+    - 仅当物理行 lstrip 后以 `|` 开头、却未以 `|` 结尾时，视为被折断的表格行起点；
+    - 向后拼接后续物理行（以单空格连接）直到累计缓冲以 `|` 收尾（该行结构闭合）；
+    - 遇到空行则放弃拼接（表格到此为止），原样保留当前行，避免吞并正文段落。
+    已是完整表格行（首尾都有 `|`）及非表格行均原样输出。
+    """
+    if "|" not in text:
+        return text
+    lines = text.split("\n")
+    out: List[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        raw = lines[i]
+        stripped = raw.rstrip()
+        # 折行起点：以 | 开头却没以 | 结尾
+        if stripped.lstrip().startswith("|") and not stripped.endswith("|"):
+            buf = stripped
+            j = i + 1
+            closed = False
+            while j < n:
+                nxt = lines[j].strip()
+                if not nxt:  # 空行：表格在此中断，放弃拼接
+                    break
+                buf = buf + " " + nxt
+                j += 1
+                if buf.endswith("|"):  # 列结构闭合
+                    closed = True
+                    break
+            if closed:
+                out.append(buf)
+                i = j
+                continue
+            # 未闭合：不改动，原样输出当前行后逐行推进
+            out.append(raw)
+            i += 1
+        else:
+            out.append(raw)
+            i += 1
+    return "\n".join(out)
+
+
 def _body_contains_markdown_table(body: str) -> bool:
     """按空行分块检测页面正文中是否存在 Markdown 表格（判据严格，避免误触发）"""
     return any(is_markdown_table(block) for block in re.split(r'\n\s*\n', body))
@@ -789,6 +840,10 @@ def chunk_pdf(documents: List[Dict[str, Any]], chunk_size: int = DEFAULT_CHUNK_S
 
         # 剥离页首标记后的正文（表格检测/表格切分都基于纯正文）
         body = _strip_leading_page_markers(text)
+        # 修复宽表被换行折断的行：把多物理行拼回标准 Markdown 表行，
+        # 使含表页能被 _body_contains_markdown_table 识别，进而复用
+        # split_markdown_table（表头随行）+ table_rows_to_sentences（行级语义）
+        body = unwrap_wrapped_table_lines(body)
 
         # === 含表页：该页单独走表格感知策略（修复前是整个PDF共用首页metadata） ===
         if _body_contains_markdown_table(body):

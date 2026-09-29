@@ -1,5 +1,5 @@
 """
-eval_runner.py - 评测脚本
+runner.py - 评测脚本（忠实迁移自 src/eval_runner.py）
 
 功能:
 1. 读取 qa_test_v2.jsonl 评测集
@@ -11,10 +11,15 @@ eval_runner.py - 评测脚本
 4. 输出分类统计报告
 
 用法:
-    python src/eval_runner.py                          # 运行全部评测
-    python src/eval_runner.py --top-k 10               # 指定 K 值
-    python src/eval_runner.py --retrieval-only         # 仅测检索指标（跳过 LLM，轻量快速）
-    python src/eval_runner.py --dataset test_dataset/qa_test_v2.jsonl --output eval_v2.json
+    python -m eval                              # 运行全部评测
+    python -m eval --top-k 10                   # 指定 K 值
+    python -m eval --retrieval-only             # 仅测检索指标（跳过 LLM，轻量快速）
+    python -m eval --dataset ../test_dataset/qa_test_v2.jsonl --output eval_v2.json
+
+迁移差异（仅接入点，逻辑与 src 保持一致）:
+- 配置来自包内 app.core.config.settings（默认评测集 = settings.test_dataset_file）
+- Pipeline 来自包内 app.rag.pipeline.get_pipeline / RAGPipeline
+- 输出目录锚定项目根 output/（不随 cwd 变化）
 """
 
 import json
@@ -22,7 +27,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 from collections import defaultdict
 
 # Windows 下 stdout 被重定向（管道/文件）时默认走 GBK，emoji 会直接崩溃；统一强制 UTF-8
@@ -33,14 +38,14 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
-from config import TEST_DATASET_FILE
-from rag_pipeline import get_pipeline, RAGPipeline
+from app.core.config import settings
+from app.rag.pipeline import get_pipeline, RAGPipeline
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# 评测输出统一目录
-OUTPUT_EVAL_DIR = Path("output")
+# 评测输出统一目录（锚定项目根，避免受启动目录影响）
+OUTPUT_EVAL_DIR = settings.base_dir / "output"
 
 
 def dump_text_report(report: Dict[str, Any], txt_path: Path):
@@ -388,7 +393,7 @@ class EvalRunner:
 
 def main():
     parser = argparse.ArgumentParser(description="RAG 评测脚本")
-    default_dataset_path = Path(TEST_DATASET_FILE).with_suffix(".jsonl")
+    default_dataset_path = settings.test_dataset_file
     parser.add_argument("--dataset", type=str, default=str(default_dataset_path),
                         help="评测集路径 (JSONL 格式)")
     parser.add_argument("--top-k", type=int, default=5, help="检索 Top‑K")

@@ -1,10 +1,12 @@
 .env
 processed_cache/ 
 qdrant_storage/ 
-__pycache__/ 
-*.pyc 
-venv/ 
-rag_py311/ 
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.egg-info/
+rag_py311/
 
 # IDE / 本地工具
 .idea/

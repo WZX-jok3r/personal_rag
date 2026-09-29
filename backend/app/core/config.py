@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     default_chunk_size: int = 512
     default_chunk_overlap: int = 50
 
+    # ==================== 文档解析 ====================
+    pdf_subdir: str = "pdf_examples"          # 知识库内 PDF 示例子目录名
+    use_marker_for_pdf: bool = True           # 无线表格 PDF 三级提取失败时用 marker 转 md（未装则优雅降级）
+
     # ==================== 检索（dense + BM25 混合 + RRF）====================
     top_k: int = 5
     retrieval_mode: str = "hybrid"            # vector | hybrid

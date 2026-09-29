@@ -13,7 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.cache.redis import SessionCache
 from app.core.security import Principal, resolve_principal
 from app.database import db
+from app.services.ingestion_service import IngestionService
 from app.services.session_service import SessionService
+from app.worker.pool import get_arq_pool
 
 
 def get_principal(
@@ -40,3 +42,12 @@ def get_session_service() -> SessionService:
     if _session_service is None:
         _session_service = SessionService(db.sessionmaker, SessionCache())
     return _session_service
+
+
+def get_ingestion_service() -> IngestionService:
+    """FastAPI 依赖：入库编排服务（建记录 + 经 ARQ 连接池入队）。
+
+    ARQ 连接池在 lifespan 启动时创建；无池（未起 infra）时入队会失败，
+    但与「下载/查询状态」解耦，状态真相始终在 PG。
+    """
+    return IngestionService(db.sessionmaker, get_arq_pool())

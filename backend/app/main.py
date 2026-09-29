@@ -24,6 +24,7 @@ from app.core.config import settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import setup_logging
 from app.database import db
+from app.worker.pool import close_arq_pool, create_arq_pool
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,14 @@ async def lifespan(app: FastAPI):
         logger.info("[Redis] 连接正常")
     except Exception as e:
         logger.warning("[Redis] 探活失败: %s", e)
+    # ARQ 连接池（API 侧入队用）；Redis 不可用时池化命令会延迟报错，不阻断启动
+    try:
+        await create_arq_pool()
+        logger.info("[ARQ] 入队连接池已就绪")
+    except Exception as e:
+        logger.warning("[ARQ] 连接池创建失败: %s", e)
     yield
+    await close_arq_pool()
     await db.dispose()
     await redis_client.dispose()
     logger.info("Shutdown complete: %s", settings.app_name)

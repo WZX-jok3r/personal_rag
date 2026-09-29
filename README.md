@@ -158,6 +158,83 @@ python -m eval --retrieval-only
 cd frontend && npm install && npm run dev
 ```
 
+### 运行验证清单（照做即可端到端演示）
+
+> 环境为 Windows PowerShell：命令统一用 `curl.exe`（带 `.exe` 以免命中 `Invoke-WebRequest` 别名）；含中文的请求体先写成 **UTF-8 文件**再 `--data-binary @file`，规避 shell 对引号/转义的破坏。演示租户 Key 以 `abc_wzx11`（对应 `RAG_TENANT_KEYS` 中的租户 a）为例。
+
+**步骤 0 · 前置**
+- [ ] Docker Desktop 已启动；仓库根 `.env` 已配 `SILICONFLOW_API_KEY`、`RAG_TENANT_KEYS=a=abc_wzx11;...`
+- [ ] Qdrant 目标 collection（默认 `personal_rag_v2`）已索引过语料（否则问答无召回）
+
+**步骤 1 · 起全栈并确认健康**
+```powershell
+cd docker_setting
+docker compose up -d --build
+docker compose ps
+```
+- [ ] 期望：`backend / frontend / postgres / redis` 均 `(healthy)`，`worker` `Up`，`qdrant` `Up`；一次性 `migrate` 跑完 `alembic upgrade head` 后 `Exited (0)` 属正常
+
+**步骤 2 · 健康检查与配置回显**
+```powershell
+curl.exe -s -H 'X-API-Key: abc_wzx11' http://localhost:8080/api/v1/health
+```
+- [ ] 期望：`"status":"ok"`，并回显 `collection / retrieval_mode / rerank_enabled / llm_model` 等
+
+**步骤 3 · 单轮问答（检索 + 精排 + 低分过滤 + 租户过滤 + 生成）**
+```powershell
+# 先把请求体存为 UTF-8 文件 q.json：{"query":"路由器的质保期是多久？","top_k":5}
+curl.exe -s -X POST -H 'X-API-Key: abc_wzx11' -H 'Content-Type: application/json; charset=utf-8' --data-binary '@q.json' http://localhost:8080/api/v1/query
+```
+- [ ] 期望：返回 `answer`（真实生成）、`sources[]`（含 `source/score/text_preview`）、`retrieved_count ≥ 1`、`hidden_count`（被低相关过滤的条数）
+
+**步骤 4 · SSE 流式多轮对话**
+```powershell
+# body 文件 s.json：{"message":"产品有哪些主要功能？","top_k":5}
+curl.exe -N -s -X POST -H 'X-API-Key: abc_wzx11' -H 'Content-Type: application/json; charset=utf-8' --data-binary '@s.json' http://localhost:8080/api/v1/chat/stream
+```
+- [ ] 期望：`-N` 下逐帧输出，先 1 帧 `"type":"meta"` → 多帧 `"type":"delta"` → 末帧 `"type":"done"`（首帧 <1s 即证明 nginx 未缓冲）
+
+**步骤 5 · 文档上传 + 异步入库（验证 worker）**
+```powershell
+cd ..   # 回到仓库根
+curl.exe -s -X POST -H 'X-API-Key: abc_wzx11' -F 'file=@knowledge_base/warranty_policy.md' http://localhost:8080/api/v1/documents
+# 记下返回的 task_id，替换下面 <TASK_ID>
+curl.exe -s -H 'X-API-Key: abc_wzx11' http://localhost:8080/api/v1/documents/<TASK_ID>/status
+```
+- [ ] 期望：上传**秒回** `"status":"queued"`（大文件亦然，因后台处理）；轮询数次后变 `"status":"done", "progress":100` 且带 `document_id`
+- [ ] 可选：`docker compose logs -f worker` 观察后台 `解析→分块→向量化→索引` 过程
+
+**步骤 6 · 列出与删除文档（一体化清理）**
+```powershell
+curl.exe -s -H 'X-API-Key: abc_wzx11' http://localhost:8080/api/v1/documents
+curl.exe -s -X DELETE -H 'X-API-Key: abc_wzx11' http://localhost:8080/api/v1/documents/<DOC_ID>
+```
+- [ ] 期望：列表出现该文档（`ready`、`chunk_count≥1`）；删除返回 `vectors_cleared:true, file_removed:true`；再查列表已无该条，`knowledge_base/` 下对应 `xxxxxxxx_` 副本被物理删除
+
+**步骤 7 · 前端 UI 演示**
+```
+浏览器打开 http://localhost:8080
+```
+- [ ] 右上「🔑 租户」显示**已连接**（构建期已烘入 `abc_wzx11`）；若显示「Key 无效/未设置」→ 点开填 `abc_wzx11`（**只填值，勿带 `a=` 前缀**）→ 保存并校验
+- [ ] 输入问题 → 流式气泡逐字输出 + 下方来源列表 + 「已隐藏 N 条」徽标
+- [ ] 「📄 上传文档」→ 选文件 → 进度条轮询到 `done` → 「知识库已登记文档」出现该条 → 点「删除」确认后从列表消失
+- [ ] 切换租户：把 Key 换成 `RAG_TENANT_KEYS` 里另一租户的值 → 列表随之变为空/不同（租户 ACL 生效），会话自动更换不串号
+
+**步骤 8 · 离线评测基线（可选）**
+```powershell
+cd backend
+..\.venv\Scripts\python.exe -m eval --retrieval-only
+```
+- [ ] 期望：`通过率/Recall@5 ≈ 92%`、`MRR ≈ 0.90`（与迁移前逐项对齐；产物写 `output/`，已 gitignore）
+
+**步骤 9 · 收尾**
+```powershell
+cd docker_setting
+docker compose down        # 停止但保留数据卷/向量库（切勿 down -v，会清空存储）
+```
+
+> **常见坑**：单独 `up -d backend` 重建后端后，nginx 可能缓存旧上游 IP 致 `:8080` 报 502，补 `docker compose restart frontend` 重新解析即恢复。
+
 ---
 
 ## 七、API 一览（`/api/v1`）

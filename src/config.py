@@ -33,8 +33,8 @@ QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 QDRANT_COLLECTION_NAME = os.getenv("QDRANT_COLLECTION_NAME", "personal_rag_v2")
 
 # ==================== SiliconFlow API 配置 ====================
-SILICONFLOW_API_KEY = os.getenv("SILICONFLOW_API_KEY", "")
-SILICONFLOW_BASE_URL = os.getenv("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1")
+LLM_API_KEY = os.getenv("SILICONFLOW_API_KEY", "")
+LLM_BASE_URL = os.getenv("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1")
 
 # ==================== Embedding 模型配置 (SiliconFlow) ====================
 # BAAI/bge-m3 向量维度为 1024

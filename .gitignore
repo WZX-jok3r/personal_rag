@@ -1,6 +1,8 @@
 .env
 processed_cache/ 
-qdrant_storage/ 
+qdrant_storage/
+pgdata/
+redisdata/ 
 __pycache__/
 *.pyc
 venv/

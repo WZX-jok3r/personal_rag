@@ -19,9 +19,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__
 from app.api.router import api_router
+from app.cache.redis import redis_client
 from app.core.config import settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import setup_logging
+from app.database import db
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +34,22 @@ async def lifespan(app: FastAPI):
         "Starting %s v%s (env=%s, auth=%s)",
         settings.app_name, __version__, settings.environment, settings.auth_enabled,
     )
-    # P2: 预热 Qdrant 连接、校验/创建 collection
-    # P3: 初始化 PostgreSQL async 会话管理器（database.sessionmanager.init）
-    # P3: 初始化 Redis 连接池
+    # 初始化外部资源连接池（DB / Redis 为强依赖，Qdrant 懒加载）
+    db.init()
+    redis_client.init()
+    try:
+        await db.healthcheck()
+        logger.info("[DB] PostgreSQL 连接正常")
+    except Exception as e:  # 探活失败不阻断启动，仅告警（便于无 DB 的环境先起服务）
+        logger.warning("[DB] PostgreSQL 探活失败（表未迁移或服务未就绪？）: %s", e)
+    try:
+        await redis_client.healthcheck()
+        logger.info("[Redis] 连接正常")
+    except Exception as e:
+        logger.warning("[Redis] 探活失败: %s", e)
     yield
-    # P3: 关闭 DB / Redis 连接
+    await db.dispose()
+    await redis_client.dispose()
     logger.info("Shutdown complete: %s", settings.app_name)
 
 

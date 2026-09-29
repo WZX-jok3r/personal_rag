@@ -1,0 +1,14 @@
+# 构建上下文瘦身：虚拟环境与缓存绝不进镜像/上下文
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
+.env.*
+!.env.example
+Dockerfile
+.dockerignore

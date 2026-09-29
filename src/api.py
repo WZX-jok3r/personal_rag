@@ -15,8 +15,8 @@ api.py - FastAPI 后端服务（前后端分离的"后端"）
     或
     uvicorn api:app --reload --port 8000   # 在 src/ 目录下
 
-浏览器打开 http://localhost:8000/ 有一个测试多轮 session 的演示页；
-接口文档见 http://localhost:8000/docs
+浏览器打开 http://localhost:8000/ ：若已构建前端(frontend/dist)则直接是 Vue SPA（含 SSE 流式）；
+未构建时回退到一个测试多轮 session 的演示页。接口文档见 http://localhost:8000/docs
 """
 
 import time
@@ -24,12 +24,14 @@ import uuid
 import json
 import logging
 import threading
+from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from config import (
@@ -49,6 +51,10 @@ from auth import Principal, require_principal
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# 前端 SPA 构建产物目录（frontend/dist）。存在则托管 SPA，否则回退到内置演示页。
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_FRONTEND_DIST = _PROJECT_ROOT / "frontend" / "dist"
 
 # ==================== session 存储策略可调参数 ====================
 # 单会话最多保留的历史消息条数（user+assistant 各算 1 条），超出丢弃最早的，防止 prompt 无限膨胀
@@ -401,9 +407,23 @@ async function newSession(){
 </body></html>"""
 
 
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
-def demo():
-    return _DEMO_HTML
+# ==================== 前端托管 ====================
+# 生产：若存在 Vue SPA 构建产物(frontend/dist)，用 StaticFiles 托管在根路径，
+#   :8000 直接就是流式 SPA（与 /api 同源，免 CORS、免 Vite 代理）。
+#   本 mount 必须在所有 /api 路由之后注册：Starlette 按注册顺序匹配，
+#   /api/* 与 /docs 先命中，未匹配的才落到 SPA 静态资源；html=True 使 "/" 返回 index.html。
+# 回退：dist 不存在（未 build）时，仍提供内置演示页，保证 :8000 可用。
+if (_FRONTEND_DIST / "index.html").is_file():
+    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIST), html=True), name="spa")
+    logger.info(f"[API] 已托管前端 SPA: {_FRONTEND_DIST}")
+else:
+    logger.warning(
+        f"[API] 未找到前端构建产物 {_FRONTEND_DIST}，回退到内置演示页（如需 SPA 请先在 frontend/ 执行 npm run build）"
+    )
+
+    @app.get("/", response_class=HTMLResponse, include_in_schema=False)
+    def demo():
+        return _DEMO_HTML
 
 
 def main():

@@ -11,8 +11,10 @@ from fastapi import Header
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache.redis import SessionCache
+from app.core.config import settings
 from app.core.security import Principal, resolve_principal
 from app.database import db
+from app.rag.pipeline import RAGPipeline
 from app.services.ingestion_service import IngestionService
 from app.services.session_service import SessionService
 from app.worker.pool import get_arq_pool
@@ -51,3 +53,36 @@ def get_ingestion_service() -> IngestionService:
     但与「下载/查询状态」解耦，状态真相始终在 PG。
     """
     return IngestionService(db.sessionmaker, get_arq_pool())
+
+
+# RAGPipeline 为进程级单例：避免每请求重建 Qdrant / LLM 连接
+_pipeline: Optional[RAGPipeline] = None
+
+
+def get_pipeline() -> RAGPipeline:
+    """FastAPI 依赖：返回进程级单例 RAGPipeline（懒初始化）。"""
+    global _pipeline
+    if _pipeline is None:
+        _pipeline = RAGPipeline()
+    return _pipeline
+
+
+def resolve_top_k(top_k: Optional[int]) -> int:
+    """请求未指定 top_k 时回退到配置默认值。"""
+    return int(top_k) if top_k else settings.top_k
+
+
+def enforced_filter(
+    client_filter: Optional[dict], principal: Principal
+) -> Optional[dict]:
+    """服务端强制叠加租户隔离（迁移自 src/api.py）。
+
+    - 客户端可传普通业务过滤（如 format），但绝不能覆盖租户键；
+    - tenant_id 以已认证 Principal 为准（后写覆盖）；
+    - 鉴权关闭时 principal.tenant_id 为 None，不注入租户条件。
+    """
+    merged = dict(client_filter or {})
+    merged.pop(settings.tenant_field, None)
+    if principal.tenant_id is not None:
+        merged[settings.tenant_field] = principal.tenant_id
+    return merged or None

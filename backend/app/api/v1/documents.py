@@ -1,0 +1,109 @@
+"""文档入库路由（P5）。
+
+- POST /api/v1/documents          multipart 上传 → 落盘知识库 → 入队 ARQ → 202 返回 task_id
+- GET  /api/v1/documents/{id}/status  轮询任务状态（读 PG 真相）
+- GET  /api/v1/documents         列出当前租户已登记文档
+
+上传只负责「落盘 + 入队」，解析/向量化由 worker 后台执行，故大文件也秒返回。
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, File, UploadFile, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
+
+from app.api.deps import get_db, get_ingestion_service, get_principal
+from app.core.config import settings
+from app.core.exceptions import AppException
+from app.core.security import Principal
+from app.repositories.document_repo import DocumentRepository
+from app.schemas.documents import (
+    DocumentItem,
+    DocumentListResponse,
+    TaskStatusResponse,
+    UploadResponse,
+)
+from app.services.ingestion_service import IngestionService
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["documents"])
+
+_ALLOWED_SUFFIXES = settings.supported_extensions
+
+
+def _safe_target_path(filename: str) -> Path:
+    """生成落到知识库根目录下的安全唯一路径（防目录穿越 / 重名覆盖）。"""
+    name = Path(filename).name  # 去除任何路径成分
+    if not name:
+        raise AppException("文件名非法", status_code=400, error_code="BAD_FILENAME")
+    suffix = Path(name).suffix.lower()
+    if suffix not in _ALLOWED_SUFFIXES:
+        raise AppException(
+            f"不支持的文件类型: {suffix or '未知'}（支持 {sorted(_ALLOWED_SUFFIXES)}）",
+            status_code=415, error_code="UNSUPPORTED_TYPE",
+        )
+    unique = f"{uuid.uuid4().hex[:8]}_{name}"
+    kb = settings.knowledge_base_dir
+    kb.mkdir(parents=True, exist_ok=True)
+    return kb / unique
+
+
+@router.post(
+    "/documents",
+    response_model=UploadResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="上传文档并异步入库",
+)
+async def upload_document(
+    file: UploadFile = File(...),
+    principal: Principal = Depends(get_principal),
+    svc: IngestionService = Depends(get_ingestion_service),
+) -> UploadResponse:
+    if not svc.queue_ready():
+        raise AppException("入库队列不可用（Redis/ARQ 未就绪）", status_code=503, error_code="QUEUE_UNAVAILABLE")
+
+    data = await file.read()
+    if not data:
+        raise AppException("空文件", status_code=400, error_code="EMPTY_FILE")
+    dest = _safe_target_path(file.filename or "upload")
+    await run_in_threadpool(dest.write_bytes, data)
+
+    tenant_ids = [principal.tenant_id] if principal.tenant_id else None
+    task_id = await svc.submit(dest, tenant_id=principal.tenant_id, tenant_ids=tenant_ids)
+    logger.info("[API] 上传入队 %s -> task %s (tenant=%s)", dest.name, task_id, principal.tenant_id)
+    return UploadResponse(task_id=task_id, filename=dest.name, status="queued")
+
+
+@router.get(
+    "/documents/{task_id}/status",
+    response_model=TaskStatusResponse,
+    summary="查询入库任务状态",
+)
+async def get_ingest_status(
+    task_id: str,
+    svc: IngestionService = Depends(get_ingestion_service),
+) -> TaskStatusResponse:
+    return TaskStatusResponse(**await svc.get_status(task_id))
+
+
+@router.get(
+    "/documents",
+    response_model=DocumentListResponse,
+    summary="列出当前租户已登记文档",
+)
+async def list_documents(
+    principal: Principal = Depends(get_principal),
+    session: AsyncSession = Depends(get_db),
+) -> DocumentListResponse:
+    docs = await DocumentRepository(session).list_by_tenant(principal.tenant_id)
+    items = [
+        DocumentItem(id=d.id, source=d.source, format=d.format, status=d.status, chunk_count=d.chunk_count)
+        for d in docs
+    ]
+    return DocumentListResponse(documents=items, total=len(items))

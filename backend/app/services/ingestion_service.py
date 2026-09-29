@@ -32,6 +32,10 @@ class IngestionService:
         self._sm = sessionmaker
         self._pool = arq_pool
 
+    def queue_ready(self) -> bool:
+        """ARQ 入队连接池是否就绪（未起 infra 时为 None）。"""
+        return self._pool is not None
+
     async def submit(
         self,
         file_path: str | Path,

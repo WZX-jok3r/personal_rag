@@ -157,9 +157,13 @@ def process_file(file_path: Path, vector_store: VectorStore, tenant_ids: Optiona
 
     # ✅ P0: 无论新增/变更/空文件，先清理该文件的所有旧向量，保证数据一致性
     #   ACL 模型下一个文件是一份数据（一组向量），按 source 整体清理即可
-    deleted = vector_store.delete_by_metadata({"source": rel_path})
+    #   注：各 loader 写入向量 payload 的 source 均为文件名（file_path.name），
+    #   而 cache/rel_path 是相对路径；删除必须按“存储时写入的值”精确匹配，
+    #   故此处用 file_path.name 而非 rel_path（否则 MatchValue 命中 0 条、清理变空操作，
+    #   导致文件变更后重灌时旧向量残留、新旧块并存）。前提是知识库内文件名唯一。
+    deleted = vector_store.delete_by_metadata({"source": file_path.name})
     if deleted > 0:
-        logger.info(f"[Ingest] 已清理 {rel_path} 的旧向量")
+        logger.info(f"[Ingest] 已清理 {file_path.name} 的旧向量")
 
     # 1. 解析
     documents = load_file(file_path)

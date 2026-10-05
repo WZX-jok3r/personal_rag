@@ -40,7 +40,11 @@ dependencies = [
     "langfuse>=3.0.0",
 ]
 
-[project.optional-dependencies]
+# 测试依赖：用 PEP 735 dependency-groups 声明（而非 optional-dependencies extras），
+# 因为 uv sync / uv run 默认同步 dev 组而不含 extras——否则 PyCharm 装入的 pytest 会被
+# uv run 的隐式 sync 反复卸载，形成"每次启动卸 N 装 N"的互搏循环。
+# 注意：Dockerfile 用 `pip install .` 构建镜像，pip 忽略本节，生产镜像仍不含测试依赖。
+[dependency-groups]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",

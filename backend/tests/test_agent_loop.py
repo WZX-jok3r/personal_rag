@@ -44,7 +44,13 @@ class FakeLLM:
 
 
 class FakeTools:
-    """假工具：可配置成功/失败/返回内容。"""
+    """假工具：可配置成功/失败/返回内容。
+
+    ⚠️ 签名必须与 AgentTools 保持一致（含 redact / actor）——
+    否则测试会在"接口漂移"时报 TypeError，看起来像测试坏了，
+    实际是**提供了接口不匹配的实现**。这里显式声明，不吞多余 kwargs：
+    静默吞掉 **kwargs 会让真实集成错误被掩盖。
+    """
 
     def __init__(self, kb_ok=True, sql_ok=True, kb_text="知识库内容：路由器质保 24 个月",
                  sql_rows=None):
@@ -53,9 +59,14 @@ class FakeTools:
         self.kb_text = kb_text
         self.sql_rows = sql_rows if sql_rows is not None else [["Sales", 1042]]
         self.calls: List[str] = []
+        # 记录收到的权限参数，便于断言"权限确实被传到了工具层"
+        self.last_redact = None
+        self.last_actor = ""
 
-    def dispatch(self, name, args, tenant_id=None) -> ToolOutcome:
+    def dispatch(self, name, args, tenant_id=None, redact=None, actor="") -> ToolOutcome:
         self.calls.append(name)
+        self.last_redact = redact
+        self.last_actor = actor
         if name == "kb_search":
             if not self.kb_ok:
                 return ToolOutcome(ok=False, name=name, observation="检索失败", summary="检索失败")
@@ -81,10 +92,37 @@ class FakeTools:
                                payload={"tables": ["employees"]})
         return ToolOutcome(ok=False, name=name, observation="未知工具", summary="未知工具")
 
+    def sql_answer(self, question, tenant_id=None, redact=None, actor=""):
+        """模拟 Text2SQL 引擎（结构对齐 Text2SqlResult，不碰数据库）。"""
+        self.calls.append("sql_answer")
+        self.last_redact = redact
+        self.last_actor = actor
+        return FakeSqlResult()
+
 
 def tc(name: str, args: dict, call_id: str = "c1") -> ToolCall:
     import json
     return ToolCall(id=call_id, name=name, arguments=json.dumps(args, ensure_ascii=False))
+
+
+class FakeSqlResult:
+    """假 Text2SQL 结果（结构对齐 Text2SqlResult）。"""
+
+    def __init__(self) -> None:
+        self.ok = True
+        self.question = "q"
+        self.sql = "SELECT count(*) FROM employees"
+        self.columns = ["count"]
+        self.rows = [[1042]]
+        self.row_count = 1
+        self.elapsed_ms = 4
+        self.truncated = False
+        self.answer = "共 1042 人"
+        self.needs_clarification = False
+        self.clarification = ""
+        self.attempts = 1
+        self.errors: List[str] = []
+        self.redacted_columns: List[str] = []
 
 
 def collect(loop: AgentLoop, question: str, **kw) -> List[Dict[str, Any]]:
@@ -269,6 +307,42 @@ class TestEventSequenceContract:
         loop = AgentLoop(tools=FakeTools(), llm=FakeLLM())
         for e in collect(loop, "路由器的质保期是多久？"):
             json.dumps(e, ensure_ascii=False)
+
+
+class TestPermissionsAreThreaded:
+    """RBAC 权限必须真的传到工具层。
+
+    这类"参数没传下去"的缺陷**不会报错**，只会让权限静默失效 ——
+    即用户以为有脱敏，实际看到了全部数据。因此必须用测试钉死。
+
+    （本测试的由来：给工具层加 redact/actor 参数时，
+      假工具没同步签名，25 个测试报 TypeError 才发现漏传。
+      真实集成里若假对象用 **kwargs 吞掉，就会完全测不出来。）
+    """
+
+    def test_redact_reaches_tools_on_rag_path(self):
+        tools = FakeTools()
+        loop = AgentLoop(tools=tools, llm=FakeLLM())
+        list(loop.run("路由器的质保期是多久？", redact=frozenset({"employees.salary"}),
+                      actor="a:employee"))
+        assert tools.last_redact == frozenset({"employees.salary"}), "脱敏列未传到工具层"
+        assert tools.last_actor == "a:employee", "审计标识未传到工具层"
+
+    def test_redact_reaches_tools_on_sql_path(self):
+        tools = FakeTools()
+        loop = AgentLoop(tools=tools, llm=FakeLLM())
+        list(loop.run("哪个部门人数最多？", redact=frozenset({"employees.salary"}),
+                      actor="a:employee"))
+        assert tools.last_redact == frozenset({"employees.salary"})
+        assert tools.last_actor == "a:employee"
+
+    def test_no_redact_when_not_provided(self):
+        """未传权限时必须是 None（走零成本快路径，等价于未启用 RBAC）。"""
+        tools = FakeTools()
+        loop = AgentLoop(tools=tools, llm=FakeLLM())
+        list(loop.run("路由器的质保期是多久？"))
+        assert tools.last_redact is None
+        assert tools.last_actor == ""
 
 
 class TestObservability:

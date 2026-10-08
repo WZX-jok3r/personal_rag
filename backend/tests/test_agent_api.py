@@ -73,14 +73,21 @@ class FakeSqlResult:
         self.clarification = ""
         self.attempts = 1
         self.errors: List[str] = []
+        self.redacted_columns: List[str] = []
 
 
 class FakeTools:
+    """假工具集。签名与 AgentTools 保持一致（含 redact / actor）。"""
+
     def __init__(self) -> None:
         self.calls: List[str] = []
+        self.last_redact = None
+        self.last_actor = ""
 
-    def dispatch(self, name, args, tenant_id=None) -> ToolOutcome:
+    def dispatch(self, name, args, tenant_id=None, redact=None, actor="") -> ToolOutcome:
         self.calls.append(name)
+        self.last_redact = redact
+        self.last_actor = actor
         if name == "kb_search":
             return ToolOutcome(
                 ok=True, name=name, observation="路由器质保 24 个月",
@@ -93,9 +100,11 @@ class FakeTools:
                            payload={"sql": "SELECT 1", "row_count": 2, "elapsed_ms": 3,
                                     "truncated": False})
 
-    def sql_answer(self, question, tenant_id=None):
+    def sql_answer(self, question, tenant_id=None, redact=None, actor=""):
         """模拟 Text2SQL 引擎（不碰数据库）。"""
         self.calls.append("sql_answer")
+        self.last_redact = redact
+        self.last_actor = actor
         return FakeSqlResult()
 
 

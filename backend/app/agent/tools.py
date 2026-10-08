@@ -217,13 +217,19 @@ class AgentTools:
 
     # ---- 工具：SQL 查询 ----
     def sql_query(self, sql: str, tenant_id: Optional[str] = None,
-                  purpose: str = "") -> ToolOutcome:
+                  purpose: str = "",
+                  redact: Optional[frozenset] = None,
+                  actor: str = "") -> ToolOutcome:
         """执行模型给的 SQL。
 
         走与分析引擎相同的 guard + executor（四层防御完整生效）。
         注意：这里**只执行模型写好的 SQL**，不做"自然语言 -> SQL"的二次翻译
         （那是 text2sql 工具的职责；Agent 场景下模型已直接产出 SQL，
           避免多绕一次 LLM 调用）。
+
+        Args:
+            redact: 需脱敏的列（来自 Principal.redact_columns()）
+            actor: 审计标识（形如 "tenant:role"）
         """
         from app.analytics.executor import get_executor
         from app.analytics.guard import guard_sql
@@ -237,7 +243,9 @@ class AgentTools:
                 payload={"rejected": True, "reason": g.reason},
             )
 
-        qr = get_executor().execute(g.sql, tenant_id=tenant_id)
+        qr = get_executor().execute(
+            g.sql, tenant_id=tenant_id, redact=redact, actor=actor,
+        )
         if not qr.ok:
             return ToolOutcome(
                 ok=False, name="sql_query",
@@ -250,7 +258,8 @@ class AgentTools:
             ok=True, name="sql_query",
             observation=qr.observation,
             summary=f"查询返回 {qr.row_count} 行（{qr.elapsed_ms}ms）"
-                    + ("［已截断］" if qr.truncated else ""),
+                    + ("［已截断］" if qr.truncated else "")
+                    + (f"［已脱敏 {'/'.join(qr.redacted_columns)}］" if qr.redacted_columns else ""),
             payload={
                 "sql": g.sql,
                 "columns": qr.columns,
@@ -258,11 +267,14 @@ class AgentTools:
                 "row_count": qr.row_count,
                 "elapsed_ms": qr.elapsed_ms,
                 "truncated": qr.truncated,
+                "redacted_columns": qr.redacted_columns,
             },
         )
 
     # ---- 工具：自然语言统计问答（内部走 Text2SQL 引擎）----
-    def sql_answer(self, question: str, tenant_id: Optional[str] = None) -> Any:
+    def sql_answer(self, question: str, tenant_id: Optional[str] = None,
+                   redact: Optional[frozenset] = None,
+                   actor: str = "") -> Any:
         """用 Text2SQL 引擎回答自然语言统计问题。
 
         为什么把它放在工具层而不是让 Loop 直接调引擎：
@@ -272,7 +284,9 @@ class AgentTools:
         """
         s = self._session()
         try:
-            return self.text2sql.answer(question, s, tenant_id=tenant_id)
+            return self.text2sql.answer(
+                question, s, tenant_id=tenant_id, redact=redact, actor=actor,
+            )
         finally:
             s.close()
 
@@ -309,7 +323,9 @@ class AgentTools:
 
     # ---- 统一分发 ----
     def dispatch(self, name: str, args: Dict[str, Any],
-                 tenant_id: Optional[str] = None) -> ToolOutcome:
+                 tenant_id: Optional[str] = None,
+                 redact: Optional[frozenset] = None,
+                 actor: str = "") -> ToolOutcome:
         if name == "kb_search":
             return self.kb_search(
                 query=str(args.get("query", "")),
@@ -320,6 +336,8 @@ class AgentTools:
                 sql=str(args.get("sql", "")),
                 tenant_id=tenant_id,
                 purpose=str(args.get("purpose", "")),
+                redact=redact,
+                actor=actor,
             )
         if name == "list_data_tables":
             return self.list_data_tables(tenant_id=tenant_id)

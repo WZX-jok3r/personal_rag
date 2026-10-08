@@ -93,6 +93,31 @@ class Settings(BaseSettings):
     tenant_field: str = "tenant_id"
     rag_tenant_keys: str = ""                 # 格式: tenant_id=api_key;tenant2=key2
 
+    # ---- RBAC（P7）----
+    # 为什么 Text2SQL 上线后必须补 RBAC：
+    #   纯 RAG 时代，能检索到什么取决于"文档里写了什么"；
+    #   接入 SQL 之后，"能查到什么"变成可枚举的数据权限问题 ——
+    #   例如"全公司薪资最高的员工是谁"这类查询，普通员工不该能问。
+    #   这把租户隔离问题升级成了**合规问题**，必须显式建模。
+    #
+    # 角色定义：
+    #   analyst   —— 数据分析角色：可看全部列（默认角色，与改造前行为一致）
+    #   employee  —— 普通员工：**敏感列自动脱敏**
+    # 向后兼容：默认角色即 analyst + 敏感列清单为空 ⇒ 与改造前行为完全一致。
+    default_role: str = "analyst"
+    # 按租户指定角色：格式 tenant_id=role;tenant2=role2
+    # （同一租户内可再细分时，可扩展为 api_key 维度）
+    rag_tenant_roles: str = ""
+    # 敏感列清单：逗号分隔的 "表.列"；非 analyst 角色的查询结果会被脱敏。
+    # 例：employees.salary,employees.email
+    sql_redact_columns: str = "employees.salary,employees.email"
+
+    # ---- SQL 审计（P7）----
+    # 是否把每次 SQL 执行落库审计。为什么值得做：
+    #   ① 合规要求"谁在什么时候查了敏感数据"；② 出问题时能复盘；
+    #   ③ Agent 场景下模型可能生成意外查询，审计是唯一的追溯手段。
+    sql_audit_enabled: bool = True
+
     # ==================== Langfuse 可观测（软依赖，默认关闭）====================
     langfuse_public_key: str = ""
     langfuse_secret_key: str = ""
@@ -179,6 +204,35 @@ class Settings(BaseSettings):
     @property
     def auth_enabled(self) -> bool:
         return bool(self.tenant_keys)
+
+    @property
+    def tenant_roles(self) -> Dict[str, str]:
+        """解析 RAG_TENANT_ROLES -> {tenant_id: role}。留空则所有租户用 default_role。"""
+        mapping: Dict[str, str] = {}
+        for part in self.rag_tenant_roles.replace("\n", "").split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            tenant_id, role = part.split("=", 1)
+            tenant_id, role = tenant_id.strip(), role.strip()
+            if tenant_id and role:
+                mapping[tenant_id] = role
+        return mapping
+
+    @property
+    def redact_column_set(self) -> set:
+        """解析 SQL_REDACT_COLUMNS -> {"employees.salary", ...}（统一小写比较）。"""
+        out = set()
+        for part in self.sql_redact_columns.replace("\n", "").split(","):
+            p = part.strip().lower()
+            if p and "." in p:
+                out.add(p)
+        return out
+
+    @property
+    def role_for(self) -> Dict[str, str]:
+        """向后兼容别名（便于阅读）：租户 -> 角色 的映射。"""
+        return self.tenant_roles
 
     @property
     def langfuse_enabled(self) -> bool:

@@ -169,6 +169,8 @@ class Text2SqlResult:
     attempts: int = 0                # 生成尝试次数（含自修正）
     errors: List[str] = field(default_factory=list)   # 每轮的错误（审计用）
     usage: Dict[str, Any] = field(default_factory=dict)
+    # RBAC：因权限不足被脱敏的列（需透传给前端，否则用户以为看到了全部）
+    redacted_columns: List[str] = field(default_factory=list)
 
     def to_payload(self) -> Dict[str, Any]:
         """给前端/SSE 的紧凑结构。"""
@@ -183,6 +185,7 @@ class Text2SqlResult:
             "needs_clarification": self.needs_clarification,
             "clarification": self.clarification,
             "attempts": self.attempts,
+            "redacted_columns": self.redacted_columns,
         }
 
 
@@ -245,8 +248,15 @@ class Text2SqlEngine:
         tenant_id: Optional[str] = None,
         history: Optional[List[Dict[str, str]]] = None,
         max_tables: int = 4,
+        redact: Optional[frozenset] = None,
+        actor: str = "",
     ) -> Text2SqlResult:
-        """完整链路。session 用于读取 schema 元数据（rag 库）。"""
+        """完整链路。session 用于读取 schema 元数据（rag 库）。
+
+        Args:
+            redact: RBAC 需脱敏的列集合（来自 Principal.redact_columns()）
+            actor: 审计标识（形如 "tenant:role"）
+        """
         result = Text2SqlResult(ok=False, question=question)
 
         # ---- 1. 口径歧义前置检查 ----
@@ -327,8 +337,10 @@ class Text2SqlEngine:
 
             result.sql = g.sql
 
-            # ---- 6+7. 执行（内部含 EXPLAIN 预检）----
-            qr: QueryResult = self.executor.execute(g.sql, tenant_id=tenant_id)
+            # ---- 6+7. 执行（内部含 EXPLAIN 预检 + RBAC 脱敏 + 审计）----
+            qr: QueryResult = self.executor.execute(
+                g.sql, tenant_id=tenant_id, redact=redact, actor=actor,
+            )
             if not qr.ok:
                 last_error = qr.error
                 result.errors.append(f"执行失败: {qr.error[:300]}")
@@ -343,6 +355,7 @@ class Text2SqlEngine:
             result.row_count = qr.row_count
             result.elapsed_ms = qr.elapsed_ms
             result.truncated = qr.truncated
+            result.redacted_columns = list(qr.redacted_columns or [])
             return result
 
         # 重试用尽

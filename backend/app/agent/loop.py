@@ -60,7 +60,12 @@ SYSTEM_PROMPT = """你是一个企业内部知识库助手，可以调用工具�
 
 @dataclass
 class AgentState:
-    """Agent 运行状态（显式状态机，便于断言与调试）。"""
+    """Agent 运行状态（显式状态机，便于断言与调试）。
+
+    `redact` / `actor` 放在这里而不是逐个方法传参：
+    它们属于"本次调用的身份权限"，每个方法都可能需要，
+    逐层传参会污染 8 个方法签名（且容易漏传导致**权限静默失效**）。
+    """
 
     question: str
     history: List[Dict[str, str]] = field(default_factory=list)
@@ -72,6 +77,9 @@ class AgentState:
     degraded: bool = False
     degraded_reason: str = ""
     route: Optional[RouteDecision] = None
+    # RBAC / 审计：本次调用的身份权限
+    redact: Optional[frozenset] = None
+    actor: str = ""
 
 
 class AgentLoop:
@@ -112,14 +120,20 @@ class AgentLoop:
         tenant_id: Optional[str] = None,
         history: Optional[List[Dict[str, str]]] = None,
         forced_route: Optional[Route] = None,
+        redact: Optional[frozenset] = None,
+        actor: str = "",
     ) -> Iterator[Dict[str, Any]]:
         """执行 Agent，逐事件 yield（可直接转 SSE）。
 
         Args:
-            forced_route: 由调用方（API 层）预先算好的规则路由结果。
-                          不传则内部计算。
+            forced_route: 由调用方（API 层）预先算好的规则路由结果。不传则内部计算。
+            redact: RBAC 需脱敏的列集合（来自 Principal.redact_columns()）
+            actor: 审计标识（形如 "tenant:role"）
         """
-        state = AgentState(question=question, history=list(history or []))
+        state = AgentState(
+            question=question, history=list(history or []),
+            redact=redact, actor=actor,
+        )
         deadline = time.monotonic() + self.wall_clock
         t_start = time.monotonic()
 
@@ -291,7 +305,10 @@ class AgentLoop:
     def _exec_tool(self, state: AgentState, name: str, args: Dict[str, Any],
                    tenant_id: Optional[str], deadline: float) -> Optional[Dict[str, Any]]:
         """执行工具并产出 tool_result 事件。结果同时存到 self._last_outcome。"""
-        outcome = self.tools.dispatch(name, args, tenant_id=tenant_id)
+        outcome = self.tools.dispatch(
+            name, args, tenant_id=tenant_id,
+            redact=state.redact, actor=state.actor,
+        )
         self._last_outcome = outcome
         state.tool_calls.append({"name": name, "ok": outcome.ok})
 
@@ -318,7 +335,10 @@ class AgentLoop:
         try:
             if not hasattr(self.tools, "sql_answer"):
                 raise AttributeError("工具集未实现 sql_answer（无法走自然语言 SQL 路径）")
-            res = self.tools.sql_answer(state.question, tenant_id=tenant_id)
+            res = self.tools.sql_answer(
+                state.question, tenant_id=tenant_id,
+                redact=state.redact, actor=state.actor,
+            )
         except Exception as e:  # noqa: BLE001
             logger.error("[agent] text2sql 失败: %s", e)
             return ToolOutcome(ok=False, name="sql_query",

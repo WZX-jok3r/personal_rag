@@ -83,12 +83,22 @@ async def agent_stream(
     loop = get_agent_loop()
     # 调试用强制路由：把字符串转成 Route 枚举（pydantic 已用 pattern 限制了取值）
     forced = Route(req.force_route) if req.force_route else None
+    # RBAC：把身份权限收敛成两个值传给 Agent ——
+    #   redact 为空集时执行器走零成本快路径（等价于未启用 RBAC）
+    #   actor 用于审计日志（形如 "tenantA:employee"）
+    redact = principal.redact_columns()
+    actor = f"{principal.tenant_id or 'anonymous'}:{principal.role}"
+    if redact:
+        logger.info("[agent] RBAC 生效：角色=%s 将脱敏 %d 个敏感列",
+                    principal.role, len(redact))
     # Agent Loop 是同步生成器 -> 用线程池逐步驱动，事件循环不被占住
     sync_iter = loop.run(
         req.message,
         tenant_id=principal.tenant_id,
         history=history,
         forced_route=forced,
+        redact=redact,
+        actor=actor,
     )
 
     async def event_gen():

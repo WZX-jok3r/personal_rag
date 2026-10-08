@@ -32,7 +32,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -55,6 +55,8 @@ class QueryResult:
     error: str = ""                  # ok=False 时的数据库报错（可回灌给 LLM）
     # 给 LLM 的紧凑文本表示（大结果集时是统计概要而非明细）
     observation: str = ""
+    # RBAC：本次因权限不足被脱敏的列名（透传给前端与 LLM，避免"以为看到了全部"）
+    redacted_columns: List[str] = field(default_factory=list)
 
     def to_payload(self) -> Dict[str, Any]:
         """转成 SSE / JSON 友好的结构（不含 observation 大文本）。"""
@@ -65,6 +67,7 @@ class QueryResult:
             "elapsed_ms": self.elapsed_ms,
             "truncated": self.truncated,
             "error": self.error,
+            "redacted_columns": self.redacted_columns,
         }
 
 
@@ -172,13 +175,18 @@ class SqlExecutor:
 
     # ---- 执行 ----
     def execute(self, sql: str, tenant_id: Optional[str] = None,
-                skip_explain: bool = False) -> QueryResult:
+                skip_explain: bool = False,
+                redact: Optional[FrozenSet[str]] = None,
+                actor: str = "") -> QueryResult:
         """执行一条**已通过 guard 校验**的 SQL。
 
         Args:
             sql: 已被 guard.guard_sql() 改写（含 LIMIT）的语句
             tenant_id: 非空时设置 app.tenant_id，触发 RLS 行级隔离
             skip_explain: 跳过 EXPLAIN 预检（默认执行预检）
+            redact: 需要脱敏的列集合（来自 Principal.redact_columns()）；
+                    空集走零成本快路径 —— 这是保证"不配置 RBAC 就等于没有该功能"的关键
+            actor: 调用方标识（写审计日志用），如 "tenant:role"
         """
         # 1) 预检（便宜且能提前发现列名错误）
         if not skip_explain:
@@ -206,6 +214,8 @@ class SqlExecutor:
             elapsed = int((time.perf_counter() - start) * 1000)
             msg = str(e)
             logger.warning("[executor] SQL 执行失败(%dms): %s", elapsed, msg[:300])
+            self._audit(sql, actor, tenant_id, ok=False, row_count=0,
+                        elapsed_ms=elapsed, error=msg, redacted=[])
             return QueryResult(
                 ok=False, elapsed_ms=elapsed, error=msg,
                 observation=f"SQL 执行失败，数据库返回：{msg[:400]}\n"
@@ -218,12 +228,46 @@ class SqlExecutor:
         truncated = len(fetched) > self.max_rows
         rows = [list(to_jsonable(v) for v in r) for r in fetched[: self.max_rows]]
 
+        # 4) 敏感列脱敏（RBAC 的数据层落地）。
+        #    在结果集上做而不是改写 SQL —— 因为 LLM 常写 SELECT *，
+        #    按列名脱敏不依赖模型生成什么，是"默认拒绝"式的兜底。
+        masked_columns: List[str] = []
+        if redact:
+            from app.analytics.redact import redact_rows
+            rows, masked_columns = redact_rows(columns, rows, redact)
+
         res = QueryResult(
             ok=True, columns=columns, rows=rows, row_count=len(rows),
             elapsed_ms=elapsed, truncated=truncated,
+            redacted_columns=masked_columns,
         )
         res.observation = self.build_observation(res)
+
+        self._audit(sql, actor, tenant_id, ok=True, row_count=res.row_count,
+                    elapsed_ms=elapsed, error="", redacted=masked_columns)
         return res
+
+    # ---- 审计 ----
+    def _audit(self, sql: str, actor: str, tenant_id: Optional[str], *,
+               ok: bool, row_count: int, elapsed_ms: int, error: str,
+               redacted: List[str]) -> None:
+        """把每次 SQL 执行落库（审计 + 成本观测）。
+
+        为什么必须做：接入 Text2SQL 后，"谁在什么时候查了什么"是合规要求；
+        且 Agent 可能生成意外查询，审计是唯一的追溯手段。
+        审计失败**绝不能影响主流程** —— 因此这里吞掉异常只记日志。
+        """
+        if not settings.sql_audit_enabled:
+            return
+        try:
+            from app.analytics.audit import record_sql_audit
+            record_sql_audit(
+                sql=sql, actor=actor, tenant_id=tenant_id, ok=ok,
+                row_count=row_count, elapsed_ms=elapsed_ms, error=error,
+                redacted_columns=redacted,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[executor] 审计写入失败（不影响主流程）: %s", str(e)[:200])
 
     # ---- 结果 -> LLM observation ----
     def build_observation(self, res: QueryResult) -> str:
@@ -241,10 +285,21 @@ class SqlExecutor:
         if not res.ok:
             return res.observation
 
+        # 脱敏说明必须拼在最前面：让 LLM 先知道"有些列看不到"，
+        # 否则它会对着 *** 编造数值（那正是本项目要消灭的静默错误）。
+        prefix = ""
+        if res.redacted_columns:
+            cols = "、".join(res.redacted_columns)
+            prefix = (
+                f"⚠️ 权限说明：列 [{cols}] 属敏感数据，当前账号权限不足已脱敏"
+                f"（显示为 ***）。**不要猜测或编造这些列的具体数值**；"
+                f"若用户问的正是这些数据，请说明需要更高权限。\n\n"
+            )
+
         if res.row_count == 0:
-            return ("查询执行成功，但返回 0 行。注意：0 行不等于出错 —— "
-                    "它可能是「该条件下确实没有数据」。"
-                    "若你认为应有数据，请检查筛选条件（尤其是字符串大小写与日期范围）后重试。")
+            return prefix + ("查询执行成功，但返回 0 行。注意：0 行不等于出错 —— "
+                             "它可能是「该条件下确实没有数据」。"
+                             "若你认为应有数据，请检查筛选条件（尤其是字符串大小写与日期范围）后重试。")
 
         header = " | ".join(str(c) for c in res.columns)
 
@@ -264,7 +319,7 @@ class SqlExecutor:
             for r in res.rows:
                 lines.append(" | ".join("" if v is None else str(v) for v in r))
             body = "\n".join(lines)
-            return f"查询返回 {res.row_count} 行（耗时 {res.elapsed_ms}ms）：\n{body}{truncation_note}"
+            return prefix + f"查询返回 {res.row_count} 行（耗时 {res.elapsed_ms}ms）：\n{body}{truncation_note}"
 
         # 大结果集：只给概要 + 前 5 行样例
         sample = res.rows[:5]
@@ -272,7 +327,7 @@ class SqlExecutor:
         for r in sample:
             lines.append(" | ".join("" if v is None else str(v) for v in r))
         body = "\n".join(lines)
-        return (
+        return prefix + (
             f"查询返回 **{res.row_count} 行**（耗时 {res.elapsed_ms}ms），"
             f"结果集较大，此处只给前 5 行样例：\n{body}\n\n"
             f"⚠️ 明细未全部提供。请基于以下方式作答之一：\n"

@@ -24,7 +24,14 @@ param(
     [switch]$Full
 )
 
-$ErrorActionPreference = "Stop"
+# NOTE: ErrorActionPreference is deliberately "Continue", NOT "Stop".
+#   Windows PowerShell 5.1 wraps a native command's stderr output into an
+#   ErrorRecord; with ErrorActionPreference="Stop" that turns into a TERMINATING
+#   error and aborts this script even when the command succeeded. Our Python
+#   tools legitimately write progress to stderr (logging), so "Stop" would make
+#   the gate unusable. We therefore rely on $LASTEXITCODE for pass/fail, which is
+#   the correct signal for native commands anyway.
+$ErrorActionPreference = "Continue"
 
 # Repo root = parent of the directory containing this script (scripts/)
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
@@ -44,6 +51,7 @@ function Invoke-Gate {
     Write-Host ("=" * 64) -ForegroundColor DarkGray
     Write-Host ">> $Name" -ForegroundColor Cyan
     Write-Host ("=" * 64) -ForegroundColor DarkGray
+    $global:LASTEXITCODE = 0
     & $Action
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[FAIL] $Name (exit=$LASTEXITCODE)" -ForegroundColor Red
@@ -70,21 +78,20 @@ try {
     if ($Full) {
         # eval exits non-zero when any case fails; one baseline case is a known
         # miss, so a non-zero exit here is EXPECTED and not itself a gate failure.
+        # Do NOT use `exit 0` inside the gate block -- that would terminate this
+        # whole script. We simply run the eval and ignore its exit code, then let
+        # the real gate be the per-question comparison below.
         Invoke-Gate "L3a retrieval eval (retrieval-only)" {
-            & $Py -m eval --retrieval-only 2>&1 | Select-Object -Last 18 | Out-String | Write-Host
-            exit 0
+            & $Py -m eval --retrieval-only *>&1 | Select-Object -Last 18 | Out-String | Write-Host
+            $global:LASTEXITCODE = 0
         }
 
         Write-Host ""
         Write-Host ("=" * 64) -ForegroundColor DarkGray
         Write-Host ">> L3b per-question baseline comparison" -ForegroundColor Cyan
         Write-Host ("=" * 64) -ForegroundColor DarkGray
-        & $Py -m eval.compare --baseline baseline_v1 --current (Join-Path $Root "output\eval_result.json") 2>&1 | Out-String | Write-Host
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "[FAIL] L3b retrieval REGRESSION detected" -ForegroundColor Red
-            $script:Failed += "L3b regression"
-        } else {
-            Write-Host "[PASS] L3b no retrieval regression" -ForegroundColor Green
+        Invoke-Gate "L3b baseline comparison" {
+            & $Py -m eval.compare --baseline baseline_v1 --current (Join-Path $Root "output\eval_result.json") *>&1 | Out-String | Write-Host
         }
     }
     else {

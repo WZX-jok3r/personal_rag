@@ -102,6 +102,28 @@ class Settings(BaseSettings):
     postgres_pool_size: int = 20
     postgres_max_overflow: int = 10
 
+    # ==================== Analytics 只读库（Text2SQL，P1 起启用）====================
+    # 设计：业务数据放独立库 kb_analytics，由独立只读角色 kb_ro 访问，
+    # 与系统元数据库 rag 物理隔离 —— LLM 生成的 SQL 只能碰业务表，
+    # 永远碰不到 messages（会话内容）/ tenants（租户表）。
+    # 见 docs/text2sql-数据层设计.md 第一、二节。
+    analytics_db: str = "kb_analytics"
+    analytics_ro_user: str = "kb_ro"
+    # 只读角色口令。留空 = 不设口令（本地 docker 映射到 127.0.0.1，pg_hba 为 trust，
+    # 可直接连接）；生产环境务必通过环境变量注入强口令。
+    analytics_ro_password: str = ""
+
+    # ---- Text2SQL 执行护栏（安全网的第二层，见设计文档第五节）----
+    # 单次查询返回行数硬上限：超限截断，并在结果里标注 truncated=true
+    sql_max_rows: int = 200
+    # 单条 SQL 的语句级超时（毫秒）：设在连接上，保证 PG 侧真的停下
+    sql_timeout_ms: int = 5000
+    # 结果集超过该行数时，不再把明细塞进 prompt，改为只给"统计概要"
+    # 理由：LLM 无法预知结果集大小，上千行明细会直接炸掉上下文窗口
+    sql_inline_max_rows: int = 50
+    # LLM 生成 SQL 失败后，允许带错误信息重写的最多次数
+    sql_max_retry: int = 2
+
     # ==================== Redis（缓存 / 会话 / ARQ 队列，P3+P4 起启用）====================
     redis_url: str = "redis://localhost:6379/0"
     arq_queue_name: str = "rag_ingest"
@@ -164,6 +186,44 @@ class Settings(BaseSettings):
     @property
     def sync_postgres_url(self) -> str:
         """Alembic 迁移用的同步连接串（psycopg 驱动）。"""
+        return (
+            f"postgresql+psycopg://{self.postgres_user}:{self.postgres_password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        )
+
+    @property
+    def analytics_url(self) -> str:
+        """Analytics 只读库连接串（asyncpg 驱动，用只读角色）。
+
+        Text2SQL 执行器只用这一条连接，配合：
+        - 只读角色 kb_ro（GRANT SELECT only）
+        - 会话级 SET LOCAL transaction_read_only = on
+        - statement_timeout
+        三道防线保证 LLM 生成的 SQL 无法写库。
+        """
+        auth = self.analytics_ro_user
+        if self.analytics_ro_password:
+            auth = f"{auth}:{self.analytics_ro_password}"
+        return (
+            f"postgresql+asyncpg://{auth}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.analytics_db}"
+        )
+
+    @property
+    def sync_analytics_url(self) -> str:
+        """建表 / 装载用的同步连接串（psycopg 驱动，用可写账号）。
+
+        注意：这里刻意用 postgres_user（可写）而不是 kb_ro ——
+        ETL 建表需要 DDL 权限，而 kb_ro 只应有 SELECT。
+        """
+        return (
+            f"postgresql+psycopg://{self.postgres_user}:{self.postgres_password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.analytics_db}"
+        )
+
+    @property
+    def sync_maintenance_url(self) -> str:
+        """维护连接串：连到默认库（rag），用于 CREATE DATABASE 等不能在本库内做的事。"""
         return (
             f"postgresql+psycopg://{self.postgres_user}:{self.postgres_password}"
             f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"

@@ -9,6 +9,7 @@ from app.models.base import Base, TimestampMixin
 from app.models.chat import ChatSession, Message
 from app.models.document import Document, DocumentStatus
 from app.models.ingest_task import IngestTask, TaskStatus
+from app.models.llm_usage import LlmUsage
 from app.models.sql_audit import SqlAudit
 from app.models.tenant import Tenant
 
@@ -25,4 +26,5 @@ __all__ = [
     "AnalyticsTable",
     "AnalyticsColumn",
     "SqlAudit",
+    "LlmUsage",
 ]

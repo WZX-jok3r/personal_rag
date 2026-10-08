@@ -54,6 +54,40 @@ def ask(engine: Text2SqlEngine, rag_engine, question: str):
         return engine.answer(question, s)
 
 
+def assert_values_or_transient(res, expected: list, label: str) -> None:
+    """断言结果包含期望的数值；若调用失败则**仅接受瞬时故障**。
+
+    ## 为什么不能直接 `assert res.ok`
+
+    LLM 生成 + 上游 API 调用是**概率性**的：上游偶发 504（实测确认，
+    即使有 3 次重试仍可能失败），因此"这一次一定成功"不是被测系统的不变式。
+    直接断言 `res.ok` 会得到 ~1/3 概率的 flaky 测试（见 docs/经验教训.md L-012）。
+
+    ## 但也不能一律放过失败
+
+    否则"模型答错"会被静默容忍，测试失去回归价值。
+    因此判据是**区分两类失败**：
+      - 瞬时基础设施故障（超时/504/连接错误）-> 允许（不计为回归）
+      - 其它一切（生成的 SQL 语义错、数字错、guard 拒绝）-> **必须失败**
+
+    真正的"模型答对率"由评测集度量（42 题 EX 100%），
+    单测只负责守住"链路正确 + 数字正确"，不负责统计成功率。
+    """
+    if not res.ok:
+        err = " ".join(res.errors or []) + " " + (res.answer or "")
+        transient_markers = ("timeout", "timed out", "504", "502", "503",
+                             "Connection", "Gateway", "连接", "超时")
+        assert any(m.lower() in err.lower() for m in transient_markers), (
+            f"[{label}] 非瞬时故障，属于真实回归：{err[:300]}"
+        )
+        pytest.skip(f"[{label}] 上游瞬时故障，跳过（非回归）: {err[:120]}")
+        return
+
+    flat = [v for row in res.rows for v in row]
+    for exp in expected:
+        assert exp in flat, f"[{label}] 期望 {exp} 不在结果中，实际 {flat}"
+
+
 def _numbers(res) -> list:
     """把结果里的数值都摊平，便于断言"答案包含某个数字"。"""
     out = []
@@ -65,55 +99,47 @@ def _numbers(res) -> list:
 
 
 class TestHeadlineCases:
-    """改造方案第三部分里 RAG 答错或答不准的题，SQL 必须答对。"""
+    """改造方案第三部分里 RAG 答错或答不准的题，SQL 必须答对。
+
+    ⚠️ 这些用例走真实 LLM，因此用 assert_values_or_transient：
+    允许上游瞬时故障跳过，但**数字错必须失败**（否则回归会被放过）。
+    """
 
     def test_department_headcount(self, engine, rag_engine):
         """「Sales 和 Engineering 各多少人」——RAG 曾答 Engineering=25（真值 1010）。"""
         res = ask(engine, rag_engine, "员工表里 Sales 部门和 Engineering 部门各有多少人？")
-        assert res.ok, f"执行失败: {res.answer} | errors={res.errors}"
-        nums = _numbers(res)
-        assert 1042 in nums, f"缺 Sales=1042，实际 {nums}"
-        assert 1010 in nums, f"缺 Engineering=1010，实际 {nums}"
+        assert_values_or_transient(res, [1042, 1010], "各有多少人")
 
     def test_department_difference(self, engine, rag_engine):
         """差值题：RAG 曾答 1017，真值 32。"""
         res = ask(engine, rag_engine, "Sales 部门比 Engineering 部门多多少人？")
-        assert res.ok, f"执行失败: {res.answer} | errors={res.errors}"
-        assert 32 in _numbers(res), f"期望差值 32，实际 {_numbers(res)}"
+        assert_values_or_transient(res, [32], "相差多少人")
 
     def test_max_salary_person(self, engine, rag_engine):
         res = ask(engine, rag_engine, "全公司薪资最高的员工是谁，在哪个部门？")
-        assert res.ok, f"执行失败: {res.answer}"
-        nums = _numbers(res)
-        assert 179997 in nums, f"期望薪资 179997，实际 {nums}"
+        assert_values_or_transient(res, [179997], "最高薪员工")
 
     def test_2026_hires(self, engine, rag_engine):
         res = ask(engine, rag_engine, "2026 年入职的员工有多少人？")
-        assert res.ok, f"执行失败: {res.answer}"
-        assert 192 in _numbers(res), f"期望 192，实际 {_numbers(res)}"
+        assert_values_or_transient(res, [192], "2026 年入职")
 
     def test_most_department(self, engine, rag_engine):
         res = ask(engine, rag_engine, "哪个部门人数最多？有多少人？")
-        assert res.ok, f"执行失败: {res.answer}"
-        assert 1042 in _numbers(res)
+        assert_values_or_transient(res, [1042], "人数最多的部门")
 
 
 class TestSalesAndExpenses:
     def test_top_revenue_product(self, engine, rag_engine):
         res = ask(engine, rag_engine, "哪个产品的总营收最高？")
-        assert res.ok, f"执行失败: {res.answer}"
+        assert_values_or_transient(res, [], "总营收最高的产品")
 
     def test_total_sales_count(self, engine, rag_engine):
         res = ask(engine, rag_engine, "销售流水一共有多少条记录？")
-        assert res.ok, f"执行失败: {res.answer}"
-        assert 20 in _numbers(res)
+        assert_values_or_transient(res, [20], "销售流水条数")
 
     def test_expense_total(self, engine, rag_engine):
         res = ask(engine, rag_engine, "费用支出总金额是多少？")
-        assert res.ok, f"执行失败: {res.answer}"
-        # 真值 34206.68（Summary sheet 给出），允许浮点
-        nums = _numbers(res)
-        assert any(abs(n - 34206.68) < 1 for n in nums), f"期望约 34206.68，实际 {nums}"
+        assert_values_or_transient(res, [34206.68], "费用总额")
 
 
 class TestChineseColumnTable:
@@ -121,14 +147,11 @@ class TestChineseColumnTable:
 
     def test_count(self, engine, rag_engine):
         res = ask(engine, rag_engine, "橱柜成本明细表里有多少条记录？")
-        assert res.ok, f"执行失败: {res.answer}"
-        assert 6 in _numbers(res)
+        assert_values_or_transient(res, [6], "成本明细条数")
 
     def test_most_expensive(self, engine, rag_engine):
         res = ask(engine, rag_engine, "橱柜成本表里单价最贵的项目是哪个？")
-        assert res.ok, f"执行失败: {res.answer}"
-        # 最高单价 210（PET肤感门板）
-        assert 210 in _numbers(res), f"期望 210，实际 {_numbers(res)}"
+        assert_values_or_transient(res, [210], "最贵单价")
 
 
 class TestAmbiguityHandling:

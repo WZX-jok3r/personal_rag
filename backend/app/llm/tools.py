@@ -155,8 +155,17 @@ class ToolLLMClient:
         max_tokens: Optional[int] = None,
         tool_choice: str = "auto",
         timeout: int = 120,
+        scene: str = "chat_with_tools",
+        actor: str = "",
+        tenant_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> ToolChatResult:
         """非流式带工具对话。
+
+        Args:
+            scene: 调用场景标识，用于用量记账分组
+                   （如 text2sql_generate / answer_compose / summarize）
+            actor / tenant_id / session_id: 归因信息，供成本看板按角色/租户/会话聚合
 
         ⚠️ tool_choice 只用 "auto"：
            DeepSeek 官方文档明确 "required and named tool choices are not supported
@@ -199,11 +208,17 @@ class ToolLLMClient:
                 arguments=fn.get("arguments") or "",
             ))
 
+        usage = data.get("usage") or {}
+        # 记账（失败不影响主流程）
+        from app.analytics.usage import record_usage
+        record_usage(scene, self.model, usage=usage, actor=actor,
+                     tenant_id=tenant_id, session_id=session_id)
+
         return ToolChatResult(
             content=(msg.get("content") or "").strip(),
             tool_calls=calls,
             finish_reason=choice.get("finish_reason") or "",
-            usage=data.get("usage") or {},
+            usage=usage,
             raw_message=msg,
         )
 

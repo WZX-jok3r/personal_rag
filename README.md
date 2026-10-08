@@ -1,277 +1,341 @@
-# Personal RAG · 企业级多租户检索增强问答系统
+# 内部知识库 Agent · RAG + Text2SQL 双引擎
 
-> 前后端分离的全栈 RAG 平台：FastAPI 异步后端 + Vue3 SPA + PostgreSQL/Redis/Qdrant 存储 + ARQ 异步入库 + Docker Compose 一键编排。支持**混合检索 + 精排**、**多租户数据隔离**、**流式多轮问答**、**大文件后台入库**与**离线评测门禁**。
+> 前后端分离的多租户知识库 Agent：**非结构化问题走混合检索 RAG，统计类问题走 Text2SQL 精确计算**，
+> 支持跨源联合推理、流式执行轨迹、四层 SQL 安全网关与 RBAC 敏感数据脱敏。
+>
+> 技术栈：FastAPI（异步）· Vue 3 + TypeScript · PostgreSQL · Qdrant · Redis · ARQ · Docker Compose · DeepSeek-V3.2
 
 ---
 
-## 一、技术栈
+## 一、这个项目解决什么问题
 
-| 层次 | 选型 |
+### 起点：一个做得不错、但撞到天花板的 RAG 系统
+
+最初的版本是一个标准的企业级 RAG：混合检索（dense + BM25 + RRF 融合）、交叉编码器精排、
+量纲安全的低相关过滤、多租户隔离、异步大文件入库。检索指标做到 **Recall@5 99.01% / MRR 0.9703**（107 题评测集）。
+
+### 转折点：一个"静默错误 31.8 倍"的真实案例
+
+用真实系统问一个问题：
+
+> **「员工表中 Sales 部门和 Engineering 部门各有多少人？两者相差多少人？」**
+
+| | RAG 的回答 | 数据库真值 |
+|---|---|---|
+| Sales 部门人数 | 1042 | 1042 |
+| Engineering 部门人数 | **25** | **1010** |
+| 两者差值 | **1017** | **32** ← 误差 **31.8 倍** |
+
+**最危险的不是它答错了，而是它错得毫无信号**：
+
+- 5 条检索结果的 rerank 分数 **0.70 / 0.66 / 0.58 / 0.51** —— 全部正常偏高，低相关过滤一条都没拦；
+- 系统还主动写了一句 **"两个数据来源不同，但逻辑上可调和"** 来自我辩护；
+- 用户**没有任何信号**可以察觉这是错的。
+
+**根因**：检索的**相关性度量不度量完备性**。万行表被切成 242 个块，
+任何单块都不含全表聚合事实。曾经尝试的补丁（为大表预生成聚合摘要块）
+只能覆盖"分组计数最多/最少 + 数值列 Top3/Bottom3"，
+而"任意两部门对比"的组合空间是 O(n²)——**穷举预计算不可行**。
+
+### 结论与方案
+
+> **凡是需要跨全量数据精确计算的问题，必须走 SQL。**
+> 于是把它升级为双引擎 Agent：需要计算的走 Text2SQL，需要依据的走 RAG，
+> 两者都需要的做**跨源联合推理**。
+
+---
+
+## 二、架构
+
+```
+                         ┌──────────────────────────────────────────────┐
+  Browser ──SSE─────────►│  nginx :8080 （SPA + 同源反代 + SSE 关缓冲）  │
+                         └──────────────────┬───────────────────────────┘
+                                            ▼
+                         ┌──────────────────────────────────────────────┐
+                         │  FastAPI :8000                               │
+                         │  /query /chat /documents  （原有 RAG 链路）  │
+                         │  /agent/stream /agent/route （Agent 链路）   │
+                         │  /usage /usage/sql         （成本看板）      │
+                         └───┬────────────┬─────────────┬───────────────┘
+                             │            │             │
+              ┌──────────────▼──┐  ┌──────▼──────┐  ┌───▼─────────────┐
+              │ 关卡一 规则路由 │  │   Agent     │  │  ARQ worker     │
+              │ （纯函数,0成本）│  │  有界状态机  │  │  异步入库        │
+              └──────────────┬──┘  └──────┬──────┘  └───┬─────────────┘
+                             │            │             │
+                    ┌────────▼───────┐  ┌─▼──────────┐  │
+                    │ 工具 kb_search │  │ 工具        │  │
+                    │  （复用原有    │  │ sql_query   │  │
+                    │   混合检索）   │  │             │  │
+                    └────────┬───────┘  └─┬───────────┘  │
+                             │            │              │
+                    ┌────────▼─────┐  ┌───▼──────────────────────────┐
+                    │ Qdrant       │  │ kb_analytics（独立只读库）    │
+                    │ 1402 向量点  │  │ 四层防御 + RLS + RBAC 脱敏    │
+                    └──────────────┘  └──────────────────────────────┘
+```
+
+### 两条链路的关键区别
+
+| | RAG 链路 | Text2SQL 链路 |
+|---|---|---|
+| 回答什么 | 政策、条款、规格、手册等**非结构化**内容 | 计数、求和、平均、排名、对比等**精确计算** |
+| 数据来源 | Qdrant 向量检索（dense + BM25 + RRF + 精排） | PostgreSQL 只读 SQL |
+| 正确性来源 | 检索到的片段 | **数据库计算** |
+| 失败模式 | 可能"局部相关"而给出错误答案 | 生成错 SQL 会被 guard 拦或执行报错 |
+
+---
+
+## 三、核心工程亮点
+
+### 1. 四层纵深防御的只读 SQL 网关
+
+LLM 生成的 SQL 必须无法伤害数据库。**任何一层单独都不够**：
+
+| 层 | 实现 | 挡住什么 | 为什么单独不够 |
+|---|---|---|---|
+| ① AST 白名单 | `sqlglot` 解析后遍历语法树 | 非 SELECT、多语句、系统表、`pg_read_file`、`COPY TO PROGRAM`、`pg_sleep` | 📄 sqlglot 官方 FAQ 自称 *"a transpiler, not a validator"* |
+| ② 只读事务 | `set_config('transaction_read_only','on')` + `statement_timeout` | 漏网写操作、长查询 DoS | 📄 PG 官方承认只读是 *"high-level notion…does not prevent all writes to disk"* |
+| ③ 角色权限 | 独立库 + `kb_ro` 只授 `SELECT` | 任何写企图 | 挡不住"用合法 SELECT 读敏感数据" |
+| ④ 数据隔离 | RLS（`app.tenant_id`）+ RBAC 列脱敏 | 跨租户越权、越权看敏感列 | 需应用正确设置会话变量 |
+
+**44 条攻击载荷全部拦截**（含 `DROP`、多语句注入、`pg_shadow`、文件读写、命令执行、
+注释混淆、大小写/空白变体），22 条合法查询全部放行。
+
+LIMIT 注入用**外层包裹**而非尾部追加：`SELECT * FROM (<orig>) AS _q LIMIT n`——
+这样即使模型自己写了 `LIMIT 999999` 也被压住。
+
+### 2. 不做"看起来对但口径错"的回答
+
+- **口径歧义澄清**：问「平均客单价是多少？」，系统**反问**并给出候选口径，而不是猜一个。
+- **截断如实标注**：结果被行数上限截断时，`truncated` 标志**同时**推给前端（用户可见）
+  和工具观察（LLM 可见），并明确要求"不要声称这是完整结果"。
+- **大结果集保护**：>50 行只给"列名 + 行数 + 前 5 行样例"，
+  因为 LLM 无法预知结果集大小，上千行明细会炸掉上下文窗口。
+
+### 3. 有界状态机 Agent（手写，不引入框架）
+
+评估过 8 个框架（LangGraph / Pydantic AI / LlamaIndex / AutoGen / CrewAI / OpenAI Agents SDK /
+Google ADK / DB-GPT）后决定手写约 300 行有界状态机。理由：只有 3 个工具、
+循环上界明确、必须复用既有 SSE 契约与 hermetic 测试体系。
+
+**五重防失控**（框架默认往往只有前两条）：
+
+| # | 机制 | 作用 |
+|---|---|---|
+| 1 | `MAX_STEPS = 5` | 步数硬上界（状态机而非 `while True`） |
+| 2 | `WALL_CLOCK = 60s` | 墙钟超时 |
+| 3 | `MAX_LLM_CALLS = 8` | **成本上界** |
+| 4 | 相同工具+参数去重 | 检测重复调用即跳出 |
+| 5 | 失败降级纯 RAG | 保证可用性不倒退 |
+
+### 4. 三层混合路由：让"意图识别"可测试
+
+```
+关卡一  规则路由（纯函数，0 成本）
+         必须**同时**命中「聚合词」与「已注册列名词」才强路由 SQL
+关卡二  LLM function calling 自主选工具（可多选做跨源推理）
+关卡三  异常/超步数/超时 → 强制退回纯 RAG
+```
+
+**为什么必须两道关卡**：全交 LLM 则每轮多 1~2s 且可能误选；
+纯规则则处理不了"研发薪资 vs 文档带宽"这类跨源问题。
+关键是**关卡一是纯函数，107 题评测集就是它的表驱动测试用例**——
+意图识别在本项目里是可测试的，不是靠 prompt 祈祷。
+
+> 反例（评测集里真实存在）：「布洛芬最多多久吃一次？」命中聚合词"最多"，
+> 但本质是文档问题。**这就是规则层必须可单测的原因。**
+
+### 5. 向后兼容的事件契约（扩帧不改帧）
+
+前端按事件 `type` 分支渲染，其中 `meta` 承担来源列表与「已隐藏 N 条」徽标。
+改造策略：**原有 4 类事件字段一个不改**，新增 6 类轨迹事件
+（`route` / `tool_call` / `tool_result` / `sql` / `clarify` / `degraded`），
+前端对未知 type 走 `default` 忽略分支 ⇒ **旧前端 + 新后端不会崩**。
+
+⚠️ 一个容易漏的点：**降级路径必须补发标准 `meta` 帧**，
+否则 Agent 降级到 RAG 时前端拿不到它，来源列表与徽标会永久空着。
+
+---
+
+## 四、量化结果（全部可复现）
+
+| 指标 | 数值 | 复现方式 |
+|---|---|---|
+| **Text2SQL Execution Accuracy** | **100%**（42/42） | `python -m eval.text2sql_runner` |
+| **Valid SQL Rate** | 100%（42/42） | 同上 |
+| **平均生成次数** | 1.00（一次生成即正确） | 同上 |
+| **检索 Recall@5 / MRR** | 99.01% / 0.9703（107 题） | `python -m eval --retrieval-only` |
+| **单测** | **508 passed** | `pytest -q` |
+| **SQL 攻击载荷拦截** | 44/44 | `pytest tests/test_sql_guard.py` |
+| **端到端延迟** | SQL 查询 2~5ms；检索路径首帧 <1s | `scripts/check.ps1 -Full` |
+
+### 关键回归验证
+
+改造前 RAG 对「Sales 与 Engineering 各多少人、差多少」答 **1017**；
+改造后 Agent 答 **32**，并展示执行的 SQL：
+
+```
+[route]       判定为统计问题 → 走数据查询（同时命中聚合词与列名词）
+[tool_call]   读取数据表清单
+[tool_result] 共 4 张可查数据表：cost_data、employees、expenses、sales
+[tool_call]   查询数据表
+[sql]         SELECT * FROM (SELECT department, COUNT(*) AS 人数 FROM employees
+              WHERE department IN ('Sales','Engineering') GROUP BY department) AS _q
+              → 2 行 / 3ms
+[done]        Sales 部门有 1042 人，Engineering 部门有 1010 人，两者相差 32 人。
+```
+
+> **诚实说明**：100% 不等于"比公开榜单强"。本项目只有 4 张表、列有中文注释、
+> 枚举值已内联，难度远低于 BIRD（95 库 / 33.4GB / 37 领域，**人类专家 92.96%**、
+> 榜首方案约 83%）。这个数字证明的是**"schema 语义层做对了，模型就能稳定生成正确 SQL"**。
+
+---
+
+## 五、RBAC 与合规
+
+接入 SQL 之后，"能查到什么"从"文档里写了什么"变成了**可枚举的数据权限问题**
+（例如"全公司薪资最高的员工是谁"）。这把租户隔离升级成了**合规问题**。
+
+| 角色 | 同一查询的结果 |
 |---|---|
-| **前端** | Vue 3 + TypeScript + Vite + Pinia；markdown-it 渲染；原生 `fetch` + `ReadableStream` 处理 SSE 流式 |
-| **API 层** | FastAPI + Pydantic v2；应用工厂 + `lifespan` 生命周期；统一异常处理；OpenAPI 文档 |
-| **RAG 引擎** | 自研检索链路：稠密向量 + BM25 稀疏 + RRF 融合 + 交叉编码器精排 + 低相关过滤 |
-| **模型服务** | SiliconFlow：Embedding `BAAI/bge-m3`(1024d) · LLM `DeepSeek-V3.2` · Reranker `bge-reranker-v2-m3` |
-| **向量库** | Qdrant（named vectors：`dense` + `bm25` 稀疏；payload 索引；多值 keyword ACL） |
-| **关系/缓存** | PostgreSQL 16（事实来源）+ Redis 7（会话热缓存 / ARQ 队列） |
-| **持久化 ORM** | SQLAlchemy 2.0（全异步 `asyncpg`）+ Alembic 迁移（`psycopg` 同步通道） |
-| **异步任务** | ARQ（Redis 后端）worker，与 API 共享同一镜像、不同入口命令 |
-| **文档解析** | PDF / DOCX / XLSX / Markdown / TXT；表格行级语义化；marker 兜底转换（可降级） |
-| **可观测** | Langfuse（trace / span 软埋点，未配置零开销） |
-| **部署** | Docker Compose 六服务编排；nginx 托管 SPA + 同源反代 + SSE 关缓冲 |
-| **配置** | pydantic-settings 单一事实来源，`.env` 扁平变量 100% 兼容、12-factor 容器覆盖 |
+| `analyst`（默认） | `Derek Cummings，薪资 179,997` —— 全部可见 |
+| `employee` | `Derek Cummings` + "具体薪资因数据脱敏未显示" |
 
----
-
-## 二、整体架构
-
-```
-                         ┌──────────────────────────────────────────┐
-   Browser  ── HTTP ───► │  frontend  (nginx :8080)                 │
-                         │  • 托管 Vue3 SPA 静态产物                │
-                         │  • 同源反代 /api/v1 → backend:8000       │
-                         │  • SSE：proxy_buffering off（逐帧透传）  │
-                         └───────────────────┬──────────────────────┘
-                                             │
-                         ┌───────────────────▼──────────────────────┐
-                         │  backend  FastAPI (:8000)                │
-                         │  api → services → repositories → models  │
-                         │  RAG Pipeline · 鉴权 · 会话 · 入库编排   │
-                         └───┬───────────────┬──────────────┬───────┘
-                             │               │              │ enqueue
-                   ┌─────────▼───┐   ┌───────▼──────┐   ┌───▼────────────┐
-                   │ PostgreSQL  │   │   Qdrant     │   │  Redis (队列)  │
-                   │ 文档/会话/  │   │ dense+bm25   │   │  会话热缓存    │
-                   │ 任务状态    │   │ +tenant ACL  │   │  ARQ job queue │
-                   └─────────────┘   └───────▲──────┘   └───┬────────────┘
-                                             │              │ consume
-                             ┌───────────────┴──────────────▼───────┐
-                             │  worker  (ARQ, 同镜像不同命令)       │
-                             │  解析 → 分块 → Embedding → 索引      │
-                             └──────────────────────────────────────┘
-```
-
-**分层职责（后端）**：`api`（路由/依赖注入）· `core`（配置/鉴权/异常/日志）· `schemas`（DTO）· `services`（业务编排）· `repositories`（数据访问）· `models`（ORM）· `rag`（检索生成链路）· `vector`（Qdrant/Embedding）· `ingestion`（加载/分块/索引）· `llm`（模型客户端）· `worker`（异步任务）· `cache`（Redis）· `observability`（Langfuse）。
-
----
-
-## 三、核心链路
-
-### 1. 问答链路（读）
-`query / chat / chat(stream)` → **鉴权解析租户** → `Retriever`（Qdrant 混合召回 → 精排 → 低相关过滤，全程叠加 `tenant_id` 强制过滤）→ `context_builder` 组装 → `LLM` 生成 → `source_formatter` 溯源。流式版本依次产出 `meta → delta* → done` 事件。
-
-### 2. 入库链路（写，异步）
-`POST /documents`（multipart）→ 落盘知识库 + 建 `Document(pending)/IngestTask(queued)` + 入队 → **立即 202 返回 `task_id`** → worker 后台 解析→分块→向量化→写 Qdrant→回写 PG 状态（`running→done/failed`）→ 客户端凭 `task_id` 轮询。
-
-### 3. 会话链路
-`session_id` 驱动多轮：PostgreSQL 存历史为**事实来源**，Redis 作热缓存；前端仅回传 `session_id` 即维持上下文，并按租户指纹隔离，切租户自动换会话。
-
----
-
-## 四、项目亮点与难点
-
-### 🔍 检索质量：两级混合检索 + 精排
-- **稠密 + BM25 稀疏双通道**（Qdrant named vectors），**RRF 排名融合**兼顾语义与关键词精确匹配；中文经 jieba 预分词与英数串保护（型号/SKU 整体成 token），入库与查询**对称分词**。
-- **交叉编码器精排**：先召回候选（`prefetch_k`/`rerank_candidates`）再按 (query, doc) 相关性重排取 top_k；精排 API 异常**自动降级**为原始排序，保证可用性。
-- **离线评测门禁**：100+ 条 QA 评测集，retrieval-only 口径 **Recall@5 ≈ 92%、MRR ≈ 0.90**，重构前后逐项对齐。
-
-### 🛡️ 难点一：量纲安全的低相关过滤
-RRF 融合分、原始向量分、rerank 绝对分**量纲不可跨 query 比较**——套用统一绝对阈值会误杀或漏杀。方案：**仅对 rerank 绝对相关分**启用「绝对下限 + 强锤点相对断层 + 保底保留 N 条」的组合阈值策略，非 rerank 量纲只截断不设限；被过滤条数沿链路**透传前端**展示"已隐藏 N 条"，兼顾"宁缺毋滥"与"可解释"。
-
-### 🏢 难点二：多租户数据隔离（单集合 + 字段级 ACL）
-- 采用**单 collection + `tenant_id` keyword 多值字段**而非每租户建库，兼顾隔离与运维成本；Qdrant 多值 keyword 支持"一份数据多方可见"的包含式匹配。
-- 服务端**强制叠加**租户过滤且**禁止客户端覆盖**租户键（`enforced_filter`）；`API Key → Principal → tenant_id` 全链路贯穿检索、入库、会话、文档增删。
-- **软关闭设计**：未配置租户 Key 时鉴权不启用、行为与加鉴权前完全一致，不打断既有数据与本地调试；预留 JWT/RBAC 升级位（仅需替换 `resolve_principal`）。
-
-### ⚡ 难点三：同步 RAG 引擎桥接异步 API 与 SSE 流式
-底层 pipeline（Qdrant / LLM 调用）为**同步阻塞**。通过 `run_in_threadpool` / `iterate_in_threadpool` 将其逐步驱动接入 FastAPI 异步路由，**事件循环不被占住**，实现 `meta → delta → done` 的 SSE 流式；配合 nginx `proxy_buffering off` 保证逐帧实时透传（首帧 <1s）。
-
-### 📄 难点四：结构化文档解析与分块
-- **表格行级语义化**：xlsx 大表逐行转语义文本、PDF 表格多级提取，失败时以 **marker 转 Markdown** 兜底并**优雅降级**（未装不阻断）。
-- **分类型分块策略**（pdf/docx/xlsx/md/txt）+ 受保护块（表格/代码）**禁止跨类型合并**，避免语义割裂。
-- 增量入库：按 `(source, file_hash)` 判重，重灌前**按 source 精确清理旧向量**，杜绝新旧块并存。
-
-### 🧩 工程化与运维
-- **全栈容器化**：六服务 Compose 编排，含一次性 `migrate` 服务（`depends_on: service_completed_successfully`）保证建表先于应用启动；**单镜像多角色**（API / worker）。
-- **分层 + 依赖注入**：`api → service → repository → model` 清晰边界，仓储只 `flush`、事务由 service 掌控；便于用假依赖做无外部服务的单测。
-- **可观测**：Langfuse `trace/span` 软埋点覆盖检索与生成，未配置时零开销。
-- **PG 真相 + Redis 热缓存**的会话模型；文档删除以 `ON DELETE SET NULL` 保历史任务、清向量、删副本一体化。
-- **统一配置中心**：pydantic-settings 合并全部环境变量，`.env` 与容器环境变量双通道，绝对路径查找回避启动目录差异。
-
----
-
-## 五、目录结构
-
-```
-.
-├── backend/                 # FastAPI 后端（应用工厂 + 分层）
-│   ├── app/
-│   │   ├── api/             # 路由、依赖注入（v1: query/chat/sessions/documents/health）
-│   │   ├── core/            # config / security / exceptions / logging
-│   │   ├── models/          # SQLAlchemy ORM（document/chat/ingest_task/tenant）
-│   │   ├── repositories/    # 数据访问层
-│   │   ├── services/        # 业务编排（ingestion / session）
-│   │   ├── rag/             # pipeline / retriever / context_builder / prompts / source_formatter
-│   │   ├── vector/          # qdrant（混合检索/精排/过滤）· embedding（向量化/重排客户端）
-│   │   ├── ingestion/       # loader / chunking（text·table·base）/ indexer
-│   │   ├── llm/             # LLM 客户端（OpenAI 兼容）
-│   │   ├── worker/          # ARQ settings / pool / tasks（异步入库）
-│   │   ├── cache/           # Redis 客户端与会话缓存
-│   │   └── observability/   # Langfuse 埋点
-│   ├── migrations/          # Alembic
-│   ├── eval/                # 离线评测（python -m eval）
-│   └── tests/               # pytest 门禁
-├── frontend/                # Vue3 + Vite + TS SPA（Pinia / SSE / 上传与知识库管理）
-├── docker_setting/          # docker-compose.yml（六服务）+ Qdrant 存储
-├── knowledge_base/          # 知识库源文件（入库对象）
-└── test_dataset/            # QA 评测集（jsonl）
-```
+- **脱敏在结果集上按列名做**，而不是改写 SQL —— 因为 LLM 常写 `SELECT *`，
+  按列名匹配**不依赖模型生成什么**，是"默认拒绝"式的兜底。
+- **SQL 审计**：每次执行落库（谁/何时/查了什么/是否脱敏/耗时），
+  但**只记 SQL 与元数据，不记结果集**（结果集会含敏感数据，存下来等于脱敏白做）。
+- **向后兼容**：不配置 `RAG_TENANT_ROLES` 时所有人走 `analyst`，
+  脱敏只对非特权角色生效 ⇒ 不配置就等于没有这个功能。
 
 ---
 
 ## 六、快速开始
 
-### 一键全栈（推荐）
 ```bash
-cd docker_setting
-docker compose up -d --build
+# 1) 配置（唯一必填项是模型 API Key）
+cp .env.example .env      # 填 SILICONFLOW_API_KEY
+
+# 2) 起全栈（六服务 + 一次性 migrate）
+cd docker_setting && docker compose up -d --build
+
+# 3) 建 Analytics 库与只读角色，并装载业务表
+cd ../backend
+python -m app.analytics.setup_db          # 建库 + kb_ro 只读角色 + 权限自检
+python -m app.analytics.seed --all --verify   # ETL 装载 4 张表并跑真值断言
 ```
-- 前端：http://localhost:8080
-- 后端 API / 文档：http://localhost:8000/api/v1 · http://localhost:8000/docs
-- Qdrant：http://localhost:6333
 
-> 前端默认在构建期烘入演示租户 Key（`VITE_RAG_API_KEY`，默认 `abc_wzx11`）；也可在页面右上「🔑 租户」随时切换/清除，切换后自动更换会话。
+访问：
 
-### 本地开发
+| 地址 | 说明 |
+|---|---|
+| http://localhost:8080 | 前端（默认 Agent 模式，可切纯 RAG 模式） |
+| http://localhost:8000/docs | OpenAPI 文档 |
+| http://localhost:6333/dashboard | Qdrant 控制台 |
+
+### 验证改动没破坏东西（三级闸口）
+
 ```bash
-# 后端（依赖 uv/venv，需先起 postgres/redis/qdrant）
-cd backend && alembic upgrade head
-uvicorn app.main:app --reload --port 8000
+# L1 语法 + L2 全量单测（秒级）
+.\scripts\check.ps1
 
-# 入库 worker
-arq app.worker.settings.WorkerSettings
-
-# 离线评测（retrieval-only 基线）
-python -m eval --retrieval-only
-
-# 前端
-cd frontend && npm install && npm run dev
+# 再加 L3：检索评测 + 与冻结基线**逐题**比对（分钟级）
+.\scripts\check.ps1 -Full
 ```
 
-### 运行验证清单（照做即可端到端演示）
-
-> 环境为 Windows PowerShell：命令统一用 `curl.exe`（带 `.exe` 以免命中 `Invoke-WebRequest` 别名）；含中文的请求体先写成 **UTF-8 文件**再 `--data-binary @file`，规避 shell 对引号/转义的破坏。演示租户 Key 以 `abc_wzx11`（对应 `RAG_TENANT_KEYS` 中的租户 a）为例。
-
-**步骤 0 · 前置**
-- [ ] Docker Desktop 已启动；仓库根 `.env` 已配 `SILICONFLOW_API_KEY`、`RAG_TENANT_KEYS=a=abc_wzx11;...`
-- [ ] Qdrant 目标 collection（默认 `personal_rag_v2`）已索引过语料（否则问答无召回）
-
-**步骤 1 · 起全栈并确认健康**
-```powershell
-cd docker_setting
-docker compose up -d --build
-docker compose ps
-```
-- [ ] 期望：`backend / frontend / postgres / redis` 均 `(healthy)`，`worker` `Up`，`qdrant` `Up`；一次性 `migrate` 跑完 `alembic upgrade head` 后 `Exited (0)` 属正常
-
-**步骤 2 · 健康检查与配置回显**
-```powershell
-curl.exe -s -H 'X-API-Key: abc_wzx11' http://localhost:8080/api/v1/health
-```
-- [ ] 期望：`"status":"ok"`，并回显 `collection / retrieval_mode / rerank_enabled / llm_model` 等
-
-**步骤 3 · 单轮问答（检索 + 精排 + 低分过滤 + 租户过滤 + 生成）**
-```powershell
-# 先把请求体存为 UTF-8 文件 q.json：{"query":"路由器的质保期是多久？","top_k":5}
-curl.exe -s -X POST -H 'X-API-Key: abc_wzx11' -H 'Content-Type: application/json; charset=utf-8' --data-binary '@q.json' http://localhost:8080/api/v1/query
-```
-- [ ] 期望：返回 `answer`（真实生成）、`sources[]`（含 `source/score/text_preview`）、`retrieved_count ≥ 1`、`hidden_count`（被低相关过滤的条数）
-
-**步骤 4 · SSE 流式多轮对话**
-```powershell
-# body 文件 s.json：{"message":"产品有哪些主要功能？","top_k":5}
-curl.exe -N -s -X POST -H 'X-API-Key: abc_wzx11' -H 'Content-Type: application/json; charset=utf-8' --data-binary '@s.json' http://localhost:8080/api/v1/chat/stream
-```
-- [ ] 期望：`-N` 下逐帧输出，先 1 帧 `"type":"meta"` → 多帧 `"type":"delta"` → 末帧 `"type":"done"`（首帧 <1s 即证明 nginx 未缓冲）
-
-**步骤 5 · 文档上传 + 异步入库（验证 worker）**
-```powershell
-cd ..   # 回到仓库根
-curl.exe -s -X POST -H 'X-API-Key: abc_wzx11' -F 'file=@knowledge_base/warranty_policy.md' http://localhost:8080/api/v1/documents
-# 记下返回的 task_id，替换下面 <TASK_ID>
-curl.exe -s -H 'X-API-Key: abc_wzx11' http://localhost:8080/api/v1/documents/<TASK_ID>/status
-```
-- [ ] 期望：上传**秒回** `"status":"queued"`（大文件亦然，因后台处理）；轮询数次后变 `"status":"done", "progress":100` 且带 `document_id`
-- [ ] 可选：`docker compose logs -f worker` 观察后台 `解析→分块→向量化→索引` 过程
-
-**步骤 6 · 列出与删除文档（一体化清理）**
-```powershell
-curl.exe -s -H 'X-API-Key: abc_wzx11' http://localhost:8080/api/v1/documents
-curl.exe -s -X DELETE -H 'X-API-Key: abc_wzx11' http://localhost:8080/api/v1/documents/<DOC_ID>
-```
-- [ ] 期望：列表出现该文档（`ready`、`chunk_count≥1`）；删除返回 `vectors_cleared:true, file_removed:true`；再查列表已无该条，`knowledge_base/` 下对应 `xxxxxxxx_` 副本被物理删除
-
-**步骤 7 · 前端 UI 演示**
-```
-浏览器打开 http://localhost:8080
-```
-- [ ] 右上「🔑 租户」显示**已连接**（构建期已烘入 `abc_wzx11`）；若显示「Key 无效/未设置」→ 点开填 `abc_wzx11`（**只填值，勿带 `a=` 前缀**）→ 保存并校验
-- [ ] 输入问题 → 流式气泡逐字输出 + 下方来源列表 + 「已隐藏 N 条」徽标
-- [ ] 「📄 上传文档」→ 选文件 → 进度条轮询到 `done` → 「知识库已登记文档」出现该条 → 点「删除」确认后从列表消失
-- [ ] 切换租户：把 Key 换成 `RAG_TENANT_KEYS` 里另一租户的值 → 列表随之变为空/不同（租户 ACL 生效），会话自动更换不串号
-
-**步骤 8 · 离线评测基线（可选）**
-```powershell
-cd backend
-..\.venv\Scripts\python.exe -m eval --retrieval-only
-```
-- [ ] 期望：`通过率/Recall@5 ≈ 92%`、`MRR ≈ 0.90`（与迁移前逐项对齐；产物写 `output/`，已 gitignore）
-
-**步骤 9 · 收尾**
-```powershell
-cd docker_setting
-docker compose down        # 停止但保留数据卷/向量库（切勿 down -v，会清空存储）
-```
-
-> **常见坑**：单独 `up -d backend` 重建后端后，nginx 可能缓存旧上游 IP 致 `:8080` 报 502，补 `docker compose restart frontend` 重新解析即恢复。
+> 为什么必须逐题比对：聚合指标会掩盖"等量置换"——
+> A 题修好、B 题坏了，召回率仍是 99.01%，但行为已经变了。
 
 ---
 
-## 七、API 一览（`/api/v1`）
+## 七、目录结构
+
+```
+backend/
+├── app/
+│   ├── agent/            # Agent 编排（P4/P5）
+│   │   ├── router.py     #   三层混合路由第一层（纯函数，可穷举单测）
+│   │   ├── tools.py      #   3 个工具 + 异常链解包
+│   │   ├── loop.py       #   有界状态机（五重防失控）
+│   │   └── events.py     #   SSE 事件契约（扩帧不改帧）
+│   ├── analytics/        # Text2SQL（P1/P2/P3）
+│   │   ├── guard.py      #   四层防御①：AST 白名单 + LIMIT 注入
+│   │   ├── executor.py   #   四层防御②：只读事务 + 超时 + 截断标注
+│   │   ├── redact.py     #   RBAC 敏感列脱敏
+│   │   ├── text2sql.py   #   NL→SQL 全链路
+│   │   ├── schema_infer.py / ddl.py / seed.py   # ETL
+│   │   ├── schema.py / fewshot.py               # Schema Linking + 示例检索
+│   │   ├── audit.py / usage.py                  # 审计 + 成本记账
+│   │   └── sql/001_init.sql                     # 只读角色与最小权限
+│   ├── rag/ vector/ ingestion/ llm/ worker/     # 原有 RAG 链路（基本未改）
+│   └── core/             # config / security(RBAC) / retry / exceptions
+├── eval/                 # 两个评测 runner + 冻结基线
+├── tests/                # 508 项测试
+└── migrations/           # Alembic（元数据表 / 审计 / 用量）
+frontend/src/             # Vue3 SPA（AgentTrace / MessageBubble / ChatView）
+scripts/check.ps1         # 三级验证闸口
+docs/                     # 改造方案 + 数据层设计 + 经验教训（16 条）
+```
+
+---
+
+## 八、API 一览（`/api/v1`）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `GET` | `/health` | 健康检查与检索/模型配置回显 |
-| `POST` | `/query` | 单轮问答（检索 + 生成，返回答案与溯源） |
-| `POST` | `/chat` | 多轮对话（后端会话存储） |
-| `POST` | `/chat/stream` | 多轮对话 SSE 流式（`meta → delta* → done`） |
-| `POST` | `/sessions` · `DELETE /sessions/{id}` | 新建 / 删除会话 |
-| `POST` | `/documents` | 上传文档，异步入库（`202` 返回 `task_id`） |
-| `GET` | `/documents/{task_id}/status` | 轮询入库任务状态与进度 |
-| `GET` | `/documents` | 列出当前租户已登记文档 |
-| `DELETE` | `/documents/{id}` | 删除文档（向量 + 物理副本 + 登记记录一体化） |
+| `GET` | `/health` | 健康检查与配置回显 |
+| `POST` | `/query` · `/chat` · `/chat/stream` | **原有 RAG 链路**（契约已冻结，未改动） |
+| `POST` | `/sessions` · `DELETE /sessions/{id}` | 会话管理 |
+| `POST` | `/documents` · `GET /documents` · `DELETE /documents/{id}` | 文档入库/列表/删除 |
+| `GET` | `/documents/{task_id}/status` | 入库任务状态轮询 |
+| **`POST`** | **`/agent/stream`** | **Agent 主入口（SSE，含完整执行轨迹）** |
+| **`POST`** | **`/agent/route`** | **规则路由调试（纯函数，不触发 LLM/DB）** |
+| **`GET`** | **`/usage`** · **`/usage/sql`** | **LLM 成本看板 / SQL 执行健康度** |
 
-**鉴权**：请求头 `X-API-Key: <key>`（或 `Authorization: Bearer <key>`）；`RAG_TENANT_KEYS=tenantA=keyA;tenantB=keyB` 配置租户映射，留空则关闭鉴权。
+**鉴权**：请求头 `X-API-Key`；`RAG_TENANT_KEYS=tenantA=keyA;tenantB=keyB` 配置租户映射，
+`RAG_TENANT_ROLES=tenantB=employee` 配置角色。留空则鉴权软关闭（本地调试零成本）。
 
 ---
 
-## 八、关键配置（`.env`）
+## 九、工程实践与踩坑记录
 
-| 分组 | 变量 |
+本项目把**真实踩过的坑**沉淀成了 [docs/经验教训.md](docs/经验教训.md)（16 条），
+每条都是"现象 → 根因 → 处置 → 可执行的规避规则"。几条最有代表性的：
+
+| # | 坑 | 教训 |
+|---|---|---|
+| L-007 | 裸 `SELECT` 被 sqlglot 解析成合法语句，包裹后生成语法非法的 SQL | **"解析成功" ≠ "语句合法"**；实测确证了官方所说的"宽松解析" |
+| L-009 | guard 注入 `LIMIT 200` 导致执行器的"多读一行"截断判定**失效**；且截断警告写在到不了的分支里 | 靠"多读一行"判断边界时，必须回头检查上游有没有把上界卡死 |
+| L-010 | 评测指标用严格相等，把 15 个语义正确（但多返回了识别性列）的答案判成错误 | **指标错比模型错更难发现**，因为它看起来像"模型不行" |
+| L-011 | 歧义检测把「Sales 部门的平均薪资」也拦下反问 | **过度澄清比不澄清更糟**——把能答的问题变成答不了 |
+| L-012 | 把概率性行为写成确定性断言 → 必然 flaky；追查时发现真实缺陷 | flaky 测试是**探测器**，不要靠重跑掩盖 |
+| L-013 | 上游偶发 504 + 零重试；错误被包装成完全无关的信息 | 长链路必须重试；**不能只报最外层异常** |
+| L-014 | 给工具加参数后测试替身没同步签名 → 25 例失败 | 替身**不要用 `**kwargs` 吞参数**：响亮失败 >> 安静失效 |
+| L-015 | 修 `next_seq` 竞态 | **必须先写"能复现竞态"的反证测试**，否则无法区分"修好了"与"没测到" |
+
+---
+
+## 十、已知不足（诚实清单）
+
+1. **评测面窄**：Text2SQL 只有 42 题、4 张表；检索评测**不含答案质量**（faithfulness / LLM-as-judge）。
+2. **脱敏靠列名匹配**：模型给敏感列起别名（`SELECT salary AS s`）则匹配不到。
+   彻底方案是数据库列级权限 `GRANT SELECT(col)`。
+3. **worker 单并发**（`max_jobs=1`）：大文件会堵队尾。
+4. **rerank 外呼无缓存**：每次查询都打 API。
+5. **无 Prometheus 指标聚合 / 无结构化日志 / trace_id 未贯穿** HTTP→Agent→worker。
+6. **无备份与对账**：PG 与 Qdrant payload 可能漂移。
+7. **静态 API Key**：无过期/轮换/吊销；无 JWT/OIDC。
+
+---
+
+## 十一、文档索引
+
+| 文档 | 内容 |
 |---|---|
-| 模型 | `SILICONFLOW_API_KEY` · `EMBEDDING_MODEL` · `LLM_MODEL` · `RERANK_MODEL` · `VECTOR_DIM` |
-| 检索 | `RETRIEVAL_MODE`(hybrid/vector) · `TOP_K` · `PREFETCH_K` · `RERANK_ENABLED` · `RERANK_CANDIDATES` · `HYBRID_TOKENIZE` |
-| 低相关过滤 | `SCORE_ABS_MIN` · `SCORE_CONFIDENT` · `SCORE_REL_RATIO` · `SCORE_MIN_KEEP` · `SCORE_DROP_ALL_BELOW` |
-| 分块 | `DEFAULT_CHUNK_SIZE` · `DEFAULT_CHUNK_OVERLAP` · `USE_MARKER_FOR_PDF` |
-| 多租户 | `RAG_TENANT_KEYS` · `TENANT_FIELD` |
-| 存储 | `QDRANT_HOST/PORT/COLLECTION_NAME` · `POSTGRES_*` · `REDIS_URL` · `ARQ_QUEUE_NAME` |
-| 会话 | `SESSION_TTL_SECONDS` · `MAX_HISTORY_MESSAGES` |
-| 可观测 | `LANGFUSE_PUBLIC_KEY` · `LANGFUSE_SECRET_KEY` · `LANGFUSE_HOST` |
-
----
-
-## 九、质量保障
-
-- **单元/门禁测试**：`backend/tests`（鉴权、检索、分块、异步入库状态机、会话持久化、API v1、向量过滤）。
-- **评测对齐**：`backend/eval` 复刻迁移前检索口径，重构前后逐项一致（Recall@5 ≈ 92%、MRR ≈ 0.90）。
-- **端到端冒烟**：经 nginx 验证 health / query 真实生成 / SSE 流式不缓冲 / 上传入库轮询 / 文档删除全链路。
+| [docs/升级为内部知识库Agent-完整改造方案.md](docs/升级为内部知识库Agent-完整改造方案.md) | 完整改造方案：结构梳理、优缺点诊断、可行性调研、8 阶段计划、简历包装 |
+| [docs/text2sql-数据层设计.md](docs/text2sql-数据层设计.md) | 可直接执行的 DDL、只读角色、RLS、ETL 与数据源边界 |
+| [docs/经验教训.md](docs/经验教训.md) | 16 条真实踩坑记录与方法学规则 |
+| [docs/项目全景深度解析.md](docs/项目全景深度解析.md) | 原有 RAG 模块逐一梳理与端到端调用链 |
+| [docs/RAG面试题库_初中高60题.md](docs/RAG面试题库_初中高60题.md) | RAG 面试题库 |

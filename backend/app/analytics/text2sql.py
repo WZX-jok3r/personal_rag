@@ -289,7 +289,10 @@ class Text2SqlEngine:
         for attempt in range(1, self.max_retry + 2):     # 首次 + 最多 max_retry 次重写
             result.attempts = attempt
             try:
-                chat = self.llm.chat_with_tools(messages, tools=SQL_TOOLS, temperature=0.0)
+                chat = self.llm.chat_with_tools(
+                    messages, tools=SQL_TOOLS, temperature=0.0,
+                    scene="text2sql_generate", actor=actor, tenant_id=tenant_id,
+                )
             except Exception as e:  # noqa: BLE001
                 logger.error("[text2sql] LLM 调用失败: %s", e)
                 result.errors.append(str(e))
@@ -394,6 +397,7 @@ class Text2SqlEngine:
         try:
             chat = self.llm.chat_with_tools(
                 [{"role": "user", "content": prompt}], tools=None, temperature=0.2,
+                scene="text2sql_summarize",
             )
             if chat.usage:
                 result.usage = chat.usage

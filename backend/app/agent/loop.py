@@ -310,13 +310,15 @@ class AgentLoop:
         )
 
     def _exec_sql_via_engine(self, state: AgentState, tenant_id: Optional[str]) -> ToolOutcome:
-        """用 Text2SQL 引擎处理自然语言问题（含 schema linking + few-shot + 自修正）。"""
+        """用 Text2SQL 引擎处理自然语言问题（含 schema linking + few-shot + 自修正）。
+
+        注意：通过 `tools.sql_answer()` 调用，而不是自己去开 session ——
+        这样 Loop 只依赖工具契约，测试可注入纯假实现（不碰数据库）。
+        """
         try:
-            s = self.tools._session()
-            try:
-                res = self.tools.text2sql.answer(state.question, s, tenant_id=tenant_id)
-            finally:
-                s.close()
+            if not hasattr(self.tools, "sql_answer"):
+                raise AttributeError("工具集未实现 sql_answer（无法走自然语言 SQL 路径）")
+            res = self.tools.sql_answer(state.question, tenant_id=tenant_id)
         except Exception as e:  # noqa: BLE001
             logger.error("[agent] text2sql 失败: %s", e)
             return ToolOutcome(ok=False, name="sql_query",

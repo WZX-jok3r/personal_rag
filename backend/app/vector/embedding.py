@@ -14,6 +14,7 @@ from typing import Any, Dict, List
 import requests
 
 from app.core.config import settings
+from app.core.retry import call_with_retry
 from app.observability import langfuse as obs
 
 logger = logging.getLogger(__name__)
@@ -53,8 +54,14 @@ class EmbeddingClient:
 
         with obs.span("embedding", input={"count": len(texts), "model": self.model}) as sp:
             try:
-                response = requests.post(url, headers=headers, json=payload, timeout=60)
-                response.raise_for_status()
+                # 带重试：实测上游网关偶发 504，而无重试会让一次抖动
+                # 直接把整个问答打成失败（见 docs/经验教训.md L-013）
+                def _do_post():
+                    r = requests.post(url, headers=headers, json=payload, timeout=60)
+                    r.raise_for_status()
+                    return r
+
+                response = call_with_retry(_do_post, attempts=3, label="embedding")
                 data = response.json()
 
                 # 解析返回结果
@@ -117,8 +124,14 @@ class RerankClient:
         }
 
         with obs.span("rerank", input={"query": query, "candidates": len(documents), "model": self.model}) as sp:
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
-            response.raise_for_status()
+            # 带重试：rerank 失败虽会降级为原始排序（不阻断），
+            # 但降级会损失精排质量，因此也值得重试几次。
+            def _do_post():
+                r = requests.post(url, headers=headers, json=payload, timeout=30)
+                r.raise_for_status()
+                return r
+
+            response = call_with_retry(_do_post, attempts=2, label="rerank")
             data = response.json()
 
             ranked = [

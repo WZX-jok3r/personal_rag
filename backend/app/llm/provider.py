@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import requests
 
 from app.core.config import settings
+from app.core.retry import call_with_retry
 from app.observability import langfuse as obs
 
 logger = logging.getLogger(__name__)
@@ -64,8 +65,15 @@ class LLMClient:
 
         with obs.generation("llm", model=self.model, input=messages) as gen:
             try:
-                response = requests.post(url, headers=self._headers(), json=payload, timeout=120)
-                response.raise_for_status()
+                # 带重试：实测上游偶发 504（见 docs/经验教训.md L-013）。
+                # 只对**非流式**路径加重试 —— 流式已开始推帧后重试会导致
+                # 用户看到重复内容，因此流式保持"失败即报错"的既有行为。
+                def _do_post():
+                    r = requests.post(url, headers=self._headers(), json=payload, timeout=120)
+                    r.raise_for_status()
+                    return r
+
+                response = call_with_retry(_do_post, attempts=3, label="llm.complete")
                 data = response.json()
                 answer = data["choices"][0]["message"]["content"].strip()
                 usage = obs.extract_usage(data)

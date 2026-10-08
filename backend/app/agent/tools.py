@@ -27,6 +27,37 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+def describe_exception(exc: BaseException, max_chain: int = 5) -> str:
+    """沿着异常链找出**根因**并拼成可读信息。
+
+    为什么需要它（实测驱动，见 docs/经验教训.md L-013）：
+        上游 embedding 网关偶发 504，但最终冒到工具层的信息是
+        `generator didn't stop after throw()` —— 这是 contextlib 在生成器
+        异常退出时抛出的**包装异常**，完全掩盖了真实原因
+        （真正的 504 在异常链的 __cause__/__context__ 里）。
+        结果：排查时被引向"生成器/线程池"这个错误方向，浪费大量时间。
+
+    做法：遍历 __cause__ 与 __context__，收集每一层，
+    优先展示最内层（根因），并把整条链路附在后面。
+    """
+    chain: List[str] = []
+    cur: Optional[BaseException] = exc
+    seen = set()
+    while cur is not None and len(chain) < max_chain:
+        if id(cur) in seen:
+            break
+        seen.add(id(cur))
+        chain.append(f"{type(cur).__name__}: {str(cur)[:200]}")
+        cur = cur.__cause__ or cur.__context__
+
+    if not chain:
+        return "未知错误"
+    if len(chain) == 1:
+        return chain[0]
+    # 根因优先
+    return f"{chain[-1]}（异常链：{' <- '.join(chain)}）"
+
+
 # ==================== OpenAI 兼容的工具 schema ====================
 
 TOOLS: List[Dict[str, Any]] = [
@@ -149,10 +180,11 @@ class AgentTools:
         try:
             chunks, dropped = self.retriever.search(query, top_k=k, filter_dict=filter_dict)
         except Exception as e:  # noqa: BLE001
-            logger.error("[tools] kb_search 失败: %s", e)
+            detail = describe_exception(e)
+            logger.error("[tools] kb_search 失败: %s", detail)
             return ToolOutcome(
                 ok=False, name="kb_search",
-                observation=f"知识库检索失败：{str(e)[:200]}",
+                observation=f"知识库检索失败：{detail}",
                 summary="知识库检索失败",
             )
 
@@ -228,6 +260,21 @@ class AgentTools:
                 "truncated": qr.truncated,
             },
         )
+
+    # ---- 工具：自然语言统计问答（内部走 Text2SQL 引擎）----
+    def sql_answer(self, question: str, tenant_id: Optional[str] = None) -> Any:
+        """用 Text2SQL 引擎回答自然语言统计问题。
+
+        为什么把它放在工具层而不是让 Loop 直接调引擎：
+            Loop 只应依赖工具契约，不应知道"引擎需要一个 DB session"这种细节。
+            把 session 生命周期收在这里，Loop 才能被纯 hermetic 测试
+            （注入假引擎 + 假 session 工厂即可，不碰数据库）。
+        """
+        s = self._session()
+        try:
+            return self.text2sql.answer(question, s, tenant_id=tenant_id)
+        finally:
+            s.close()
 
     # ---- 工具：列出可查数据表 ----
     def list_data_tables(self, tenant_id: Optional[str] = None) -> ToolOutcome:

@@ -34,6 +34,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import requests
 
 from app.core.config import settings
+from app.core.retry import call_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -173,11 +174,17 @@ class ToolLLMClient:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice
 
-        resp = requests.post(
-            f"{self.base_url}/chat/completions",
-            headers=self._headers(), json=payload, timeout=timeout,
-        )
-        resp.raise_for_status()
+        # 带重试：实测上游偶发 504，而答案生成是链路的最后一步，
+        # 失败会直接让用户看到"回退为原始观察"的降级输出（见 docs/经验教训.md L-013）
+        def _do_post():
+            r = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers=self._headers(), json=payload, timeout=timeout,
+            )
+            r.raise_for_status()
+            return r
+
+        resp = call_with_retry(_do_post, attempts=3, label="chat_with_tools")
         data = resp.json()
 
         choice = (data.get("choices") or [{}])[0]

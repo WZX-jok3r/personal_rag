@@ -20,6 +20,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _BACKEND_DIR = Path(__file__).resolve().parents[2]
 _PROJECT_ROOT = _BACKEND_DIR.parent
 
+# Analytics 只读角色的本地开发默认口令（单一事实来源）。
+# 仅用于本机演示；该角色只有 SELECT 权限，爆炸半径限于业务数据。
+# 生产环境必须用 ANALYTICS_RO_PASSWORD 环境变量覆盖。
+# 为什么本机也必须带口令（实测结论，见 docs/经验教训.md L-004）：
+#   Docker 端口发布走 NAT，宿主机的 127.0.0.1 在容器侧被改写为网桥网关地址，
+#   因此 pg_hba.conf 里 `host all all 127.0.0.1/32 trust` 对宿主机连接永不生效，
+#   实际匹配末行 scram-sha-256 —— 必须提供口令。
+DEV_ANALYTICS_RO_PASSWORD = "kb_ro_dev_pw"
+
 
 class Settings(BaseSettings):
     """全局配置。字段名与 .env 变量大小写不敏感匹配。"""
@@ -193,13 +202,11 @@ class Settings(BaseSettings):
 
     @property
     def analytics_url(self) -> str:
-        """Analytics 只读库连接串（asyncpg 驱动，用只读角色）。
+        """Analytics 只读库连接串（**asyncpg** 驱动，用只读角色）。
 
-        Text2SQL 执行器只用这一条连接，配合：
-        - 只读角色 kb_ro（GRANT SELECT only）
-        - 会话级 SET LOCAL transaction_read_only = on
-        - statement_timeout
-        三道防线保证 LLM 生成的 SQL 无法写库。
+        用途：需要异步访问业务库时使用（配合 create_async_engine）。
+        ⚠️ 不能配 create_engine()（同步）—— 会报 MissingGreenlet。
+           同步场景请用 `sync_analytics_ro_url`。
         """
         auth = self.analytics_ro_user
         if self.analytics_ro_password:
@@ -210,6 +217,11 @@ class Settings(BaseSettings):
         )
 
     @property
+    def effective_ro_password(self) -> str:
+        """只读角色的实际口令：配置优先，否则用本地开发默认值。"""
+        return self.analytics_ro_password or DEV_ANALYTICS_RO_PASSWORD
+
+    @property
     def sync_analytics_url(self) -> str:
         """建表 / 装载用的同步连接串（psycopg 驱动，用可写账号）。
 
@@ -218,6 +230,25 @@ class Settings(BaseSettings):
         """
         return (
             f"postgresql+psycopg://{self.postgres_user}:{self.postgres_password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.analytics_db}"
+        )
+
+    @property
+    def sync_analytics_ro_url(self) -> str:
+        """只读执行器的**同步**连接串（psycopg 驱动 + kb_ro 只读角色）。
+
+        为什么需要它：SqlExecutor 目前是同步的（与本项目 rag 内核的同步风格一致，
+        由线程池桥接到异步路由）。而 `analytics_url` 用的是 asyncpg 驱动，
+        只能配 create_async_engine —— 用 create_engine() 会报
+        MissingGreenlet（greenlet_spawn has not been called）。
+        故这里单独提供同步版本，驱动与角色都对齐执行器的需要。
+        """
+        auth = self.analytics_ro_user
+        # 与 setup_db 使用同一来源，避免两处默认值漂移
+        pwd = self.effective_ro_password
+        auth = f"{auth}:{pwd}"
+        return (
+            f"postgresql+psycopg://{auth}"
             f"@{self.postgres_host}:{self.postgres_port}/{self.analytics_db}"
         )
 

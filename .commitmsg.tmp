@@ -1,0 +1,55 @@
+feat(P2): 只读 SQL 安全网关 —— 四层防御的前两层
+
+这是整个改造里最能体现工程能力的一块：LLM 生成的 SQL 必须无法伤害数据库。
+
+【第一层】app/analytics/guard.py —— AST 白名单 + LIMIT 强制注入
+选型 sqlglot 30.21.0（MIT、零依赖纯 Python、Postgres 属 Official 支持级别）。
+官方 FAQ 明确声明 "SQLGlot is a transpiler, not a validator"，
+因此本层从设计上只作为四层防御的第一层，绝不当作唯一边界。
+
+拒绝清单（每条都有对应攻击载荷测试）：
+  非 SELECT（INSERT/UPDATE/DELETE/MERGE/DROP/ALTER/CREATE/TRUNCATE/GRANT/COPY）
+  多语句注入、SELECT ... INTO（写表）、系统目录（pg_catalog/pg_shadow/pg_authid）
+  文件读写（pg_read_file/pg_ls_dir/lo_import/lo_export）
+  命令执行（COPY ... TO PROGRAM）
+  DoS（pg_sleep/pg_terminate_backend/pg_advisory_lock）
+  数据外带（dblink）、提权（SET ROLE）、会话控制（SET/BEGIN/COMMIT）
+  结构不完整（裸 SELECT）—— 见下
+
+LIMIT 注入用"外层包裹"而非尾部追加：SELECT * FROM (orig) AS _q LIMIT n
+理由：追加会与 LLM 已写的 LIMIT 冲突，且无法处理 UNION。
+
+【第二层】app/analytics/executor.py —— 只读事务 + 超时 + 结果保护
+  set_config('transaction_read_only','on') —— 写操作由数据库层拒绝
+  set_config('statement_timeout', N)      —— PG 侧真的停下
+  EXPLAIN (FORMAT JSON) 预检             —— 只做计划不执行，提前发现列名错误
+  RLS: set_config('app.tenant_id')        —— 行级租户隔离
+  大结果集保护：>50 行只给"列名+行数+前5行样例"，不做明细
+  截断如实标注：truncated 同时进 SSE 事件与 LLM observation
+
+【配套】app/analytics/schema.py —— Schema 语义层
+  数据字典渲染（枚举值内联）、表相关性打分与裁剪（Schema Linking 第一步）
+
+【测试】237 passed（P1 时 114）
+  tests/test_sql_guard.py                  95 例（44 条攻击载荷 + 22 条合法查询 + 变体绕过）
+  tests/test_sql_executor_integration.py   28 例（真连 PostgreSQL）
+  集成测试刻意破例不 hermetic —— 只读事务/EXPLAIN/RLS 全是数据库行为，mock 等于没测；
+  用 skipif 在无 PG 环境下自动跳过，不拖红整个套件。
+
+实测确证的三个关键点（均已记入 docs/经验教训.md）：
+  L-007 裸 SELECT 被 sqlglot 解析成合法 exp.Select，
+        包裹后生成 SELECT * FROM (SELECT) AS _q LIMIT n —— 在 PG 里语法非法。
+        即官方所说的"宽松解析"实测确证：解析成功不等于语句合法。
+        故补"结构完整性自检"（既无投影列又无 FROM 则拒绝）。
+  L-008 postgresql+asyncpg 不能配 create_engine()，报 MissingGreenlet。
+        新增 sync_analytics_ro_url（psycopg + 只读角色）。
+  L-009 截断判定失真：guard 注入 LIMIT 200 导致执行器的"多读一行"探测失效，
+        且截断警告被写在到不了的分支里（被截断则必是大结果集，走另一分支）。
+        修法：注入 max_rows+1，把不变式写成测试钉死、警告移出分支。
+
+验证: check.ps1 -Full 全绿
+  L1 compileall 通过
+  L2 pytest 237 passed
+  L3 检索评测无回归（Recall@5 99.01% / MRR 0.9703 与基线逐题一致）
+
+注：本提交只做安全与执行层，尚未接入 LLM 生成（P3）。

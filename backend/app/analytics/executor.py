@@ -1,0 +1,296 @@
+"""executor.py - 只读 SQL 执行器（四层防御的第二层：事务与资源限制）。
+
+职责：
+    1. 用**只读角色**连接 kb_analytics
+    2. 每条查询都在只读事务里跑：`SET LOCAL transaction_read_only = on`
+    3. 语句级超时：`SET LOCAL statement_timeout = '<n>ms'`
+    4. 结果行数上限（由 guard 的 LIMIT 注入 + 本层的读取上限双重保证）
+    5. 结果序列化（Decimal/date -> str，否则 SSE 序列化会崩）
+    6. 大结果集保护：超过阈值时**不返回明细**，只返回统计概要
+       —— 因为 LLM 无法预知结果集大小，上千行明细会炸掉 prompt 上下文
+
+⚠️ 安全立场：本层是"纵深防御"的第二层，不是唯一防线。
+    📄 PostgreSQL 官方文档自承：
+      "This is a **high-level notion of read-only that does not prevent all
+       writes to disk**."
+    → 只读事务仍有漏网路径（如 nextval()、临时表）。所以必须叠加
+      guard（AST 白名单）+ 角色权限（GRANT SELECT only）+ RLS。
+
+⚠️ 关于 EXPLAIN 预检（本项目一个重要的正确性点）：
+    📄 PostgreSQL 官方原文：
+      "The `ANALYZE` option causes the statement to be **actually executed**,
+       not only planned." + "other side effects of the statement will happen as usual."
+    → **预检只能用不带 ANALYZE 的 `EXPLAIN`**。写 `EXPLAIN ANALYZE` 等于把用户的
+      SQL 真的执行一遍，安全网关形同虚设。本模块的 explain_sql() 从设计上
+      不提供 ANALYZE 选项，并有单测断言生成的语句不含 "ANALYZE"。
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Any, Dict, List, Optional, Sequence
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class QueryResult:
+    """一次 SQL 执行的结果。"""
+
+    ok: bool
+    columns: List[str] = field(default_factory=list)
+    rows: List[List[Any]] = field(default_factory=list)
+    row_count: int = 0
+    elapsed_ms: int = 0
+    truncated: bool = False          # 是否触达 LIMIT 上限（结果不完整！）
+    error: str = ""                  # ok=False 时的数据库报错（可回灌给 LLM）
+    # 给 LLM 的紧凑文本表示（大结果集时是统计概要而非明细）
+    observation: str = ""
+
+    def to_payload(self) -> Dict[str, Any]:
+        """转成 SSE / JSON 友好的结构（不含 observation 大文本）。"""
+        return {
+            "ok": self.ok,
+            "columns": self.columns,
+            "row_count": self.row_count,
+            "elapsed_ms": self.elapsed_ms,
+            "truncated": self.truncated,
+            "error": self.error,
+        }
+
+
+# ==================== 序列化 ====================
+
+def to_jsonable(v: Any) -> Any:
+    """把 PostgreSQL 返回值转成可 JSON 序列化的类型。
+
+    必须做这一步：Decimal / date / datetime 不能被 json.dumps 处理，
+    会在 SSE 推帧时抛 TypeError。
+    """
+    if v is None:
+        return None
+    if isinstance(v, Decimal):
+        # 整数值的 Decimal 去掉小数点，避免 "1042.00" 这种噪音
+        f = float(v)
+        return int(f) if f.is_integer() else f
+    if isinstance(v, (datetime, date)):
+        return v.isoformat(sep=" ") if isinstance(v, datetime) else v.isoformat()
+    if isinstance(v, (bytes, bytearray)):
+        return f"<binary {len(v)} bytes>"
+    if isinstance(v, (list, tuple)):
+        return [to_jsonable(x) for x in v]
+    if isinstance(v, dict):
+        return {k: to_jsonable(x) for k, x in v.items()}
+    return v
+
+
+# ==================== 执行器 ====================
+
+class SqlExecutor:
+    """只读 SQL 执行器。
+
+    使用方式（同步）：
+        ex = SqlExecutor()
+        res = ex.execute(guarded_sql)      # guarded_sql 来自 guard.guard_sql()
+    """
+
+    def __init__(self, engine: Optional[Engine] = None) -> None:
+        # 关键：用 sync_analytics_ro_url（psycopg 同步驱动 + kb_ro 只读角色）。
+        # 不能用 analytics_url —— 那个是 asyncpg 驱动，create_engine() 会报
+        # MissingGreenlet（见 docs/经验教训.md L-008）。
+        self._engine = engine or create_engine(
+            settings.sync_analytics_ro_url,
+            pool_pre_ping=True,
+            pool_size=5,
+            max_overflow=5,
+        )
+        self.max_rows = settings.sql_max_rows
+        self.timeout_ms = settings.sql_timeout_ms
+        self.inline_max_rows = settings.sql_inline_max_rows
+
+    # ---- 生命周期 ----
+    def dispose(self) -> None:
+        self._engine.dispose()
+
+    # ---- 会话护栏 ----
+    # ⚠️ 为什么用 set_config() 而不是 `SET LOCAL x = :param`：
+    #    PostgreSQL 的 `SET` 是 utility 语句，**语法上不接受绑定参数** ——
+    #    写成 `SET LOCAL statement_timeout = $1` 会直接报
+    #    `syntax error at or near "$1"`（已实测）。
+    #    而 `set_config(name, value, is_local)` 是普通函数，**可以**用绑定参数，
+    #    且 is_local=true 与 SET LOCAL 语义等价（事务结束即失效）。
+    #    这样既避免了字符串拼接，也保留了事务级作用域。
+    def _apply_session_guards(self, conn, tenant_id: Optional[str]) -> None:
+        # 1) 只读事务：即使 guard 或角色权限被绕过，写操作也会被拒
+        conn.execute(text("SELECT set_config('transaction_read_only', 'on', true)"))
+        # 2) 语句级超时：保证 PG 侧真的停下，而不是应用侧断开后 PG 还在跑
+        conn.execute(
+            text("SELECT set_config('statement_timeout', :t, true)"),
+            {"t": f"{self.timeout_ms}ms"},
+        )
+        # 3) RLS：设置租户变量触发行级隔离（true = 事务结束后失效）
+        if tenant_id:
+            conn.execute(
+                text("SELECT set_config('app.tenant_id', :v, true)"), {"v": tenant_id}
+            )
+
+    # ---- 预检 ----
+    def explain_sql(self, sql: str) -> tuple[bool, str]:
+        """EXPLAIN 预检：只做计划、**不执行**。
+
+        返回 (是否可规划, 错误信息)。成本极低，却能在真正执行前
+        发现列名/类型错误 —— 这是"报错回灌让 LLM 自修正"之外更便宜的一道拦截。
+
+        ⚠️ 绝不使用 EXPLAIN ANALYZE（那会真的执行语句）。
+            本函数签名不接受任何"是否 analyze"的参数，从设计上杜绝误用。
+        """
+        stmt = f"EXPLAIN (FORMAT JSON) {sql}"
+        # 防御性断言：即使有人改了上面这行，也不允许 ANALYZE 出现
+        assert "ANALYZE" not in stmt.upper(), "EXPLAIN 预检绝不能带 ANALYZE（会真的执行）"
+
+        try:
+            with self._engine.connect() as conn:
+                conn.execute(
+                    text("SELECT set_config('statement_timeout', :t, true)"),
+                    {"t": f"{self.timeout_ms}ms"},
+                )
+                conn.execute(text(stmt))
+            return True, ""
+        except Exception as e:  # noqa: BLE001
+            msg = str(e)
+            logger.info("[executor] EXPLAIN 预检未通过: %s", msg[:200])
+            return False, msg
+
+    # ---- 执行 ----
+    def execute(self, sql: str, tenant_id: Optional[str] = None,
+                skip_explain: bool = False) -> QueryResult:
+        """执行一条**已通过 guard 校验**的 SQL。
+
+        Args:
+            sql: 已被 guard.guard_sql() 改写（含 LIMIT）的语句
+            tenant_id: 非空时设置 app.tenant_id，触发 RLS 行级隔离
+            skip_explain: 跳过 EXPLAIN 预检（默认执行预检）
+        """
+        # 1) 预检（便宜且能提前发现列名错误）
+        if not skip_explain:
+            ok, err = self.explain_sql(sql)
+            if not ok:
+                return QueryResult(
+                    ok=False, error=err,
+                    observation=f"SQL 无法被数据库规划，错误信息：{err[:400]}\n"
+                                f"请检查表名/列名是否准确后重新生成。",
+                )
+
+        # 2) 真正的执行
+        start = time.perf_counter()
+        try:
+            with self._engine.connect() as conn:
+                self._apply_session_guards(conn, tenant_id)
+                result = conn.execute(text(sql))
+                columns = list(result.keys())
+                # 多读一行用于判断"是否还有更多"。
+                # 不变式：guard 注入的外层 LIMIT = max_rows + 1，
+                # 因此这里读到 max_rows + 1 行 ⇒ 确实被截断了。
+                # 见 guard._inject_limit 的说明；两边必须同步，有单测锁死。
+                fetched = result.fetchmany(self.max_rows + 1)
+        except Exception as e:  # noqa: BLE001
+            elapsed = int((time.perf_counter() - start) * 1000)
+            msg = str(e)
+            logger.warning("[executor] SQL 执行失败(%dms): %s", elapsed, msg[:300])
+            return QueryResult(
+                ok=False, elapsed_ms=elapsed, error=msg,
+                observation=f"SQL 执行失败，数据库返回：{msg[:400]}\n"
+                            f"请据此修正 SQL 后重新生成。",
+            )
+
+        elapsed = int((time.perf_counter() - start) * 1000)
+
+        # 3) 截断判定：读到 max_rows+1 行说明还有更多
+        truncated = len(fetched) > self.max_rows
+        rows = [list(to_jsonable(v) for v in r) for r in fetched[: self.max_rows]]
+
+        res = QueryResult(
+            ok=True, columns=columns, rows=rows, row_count=len(rows),
+            elapsed_ms=elapsed, truncated=truncated,
+        )
+        res.observation = self.build_observation(res)
+        return res
+
+    # ---- 结果 -> LLM observation ----
+    def build_observation(self, res: QueryResult) -> str:
+        """把结果集转成给 LLM 看的文本。
+
+        **大结果集保护**（关键设计）：超过 inline_max_rows 时**不给明细**，
+        只给「列名 + 行数 + 前几行样例 + 截断标志」。
+
+        为什么必须这样做：
+          - LLM **无法预知**结果集大小，若把上千行塞进 prompt 会直接炸掉上下文；
+          - 更危险的是：如果不标注截断，LLM 会非常自然地把"前 N 行"当成"全部数据"
+            来回答 —— 于是又回到"错误但自信"的老问题，只是这次错误来自截断而非检索。
+            所以 truncated 标志必须同时出现在 SSE 事件（给用户看）和 observation（给 LLM 看）。
+        """
+        if not res.ok:
+            return res.observation
+
+        if res.row_count == 0:
+            return ("查询执行成功，但返回 0 行。注意：0 行不等于出错 —— "
+                    "它可能是「该条件下确实没有数据」。"
+                    "若你认为应有数据，请检查筛选条件（尤其是字符串大小写与日期范围）后重试。")
+
+        header = " | ".join(str(c) for c in res.columns)
+
+        # ⚠️ 截断警告必须**独立于分支**：只要 truncated=True 就要说清楚"这不是全部"。
+        #    曾经的错误写法是只在"小结果集"分支里加警告 —— 但被截断的结果集
+        #    恰恰必然是大结果集，会走到另一个分支，警告永远不会被打印。
+        truncation_note = ""
+        if res.truncated:
+            truncation_note = (
+                f"\n\n⚠️ 结果已被 LIMIT 截断（仅返回前 {res.row_count} 行，并非全部数据）。"
+                f"**不要声称这是完整结果**；如需全貌请改写为聚合查询"
+                f"（COUNT/SUM/AVG/MAX/MIN/GROUP BY）。"
+            )
+
+        if res.row_count <= self.inline_max_rows:
+            lines = [header, "-" * len(header)]
+            for r in res.rows:
+                lines.append(" | ".join("" if v is None else str(v) for v in r))
+            body = "\n".join(lines)
+            return f"查询返回 {res.row_count} 行（耗时 {res.elapsed_ms}ms）：\n{body}{truncation_note}"
+
+        # 大结果集：只给概要 + 前 5 行样例
+        sample = res.rows[:5]
+        lines = [header, "-" * len(header)]
+        for r in sample:
+            lines.append(" | ".join("" if v is None else str(v) for v in r))
+        body = "\n".join(lines)
+        return (
+            f"查询返回 **{res.row_count} 行**（耗时 {res.elapsed_ms}ms），"
+            f"结果集较大，此处只给前 5 行样例：\n{body}\n\n"
+            f"⚠️ 明细未全部提供。请基于以下方式作答之一：\n"
+            f"  1) 若用户要的是统计结论，请改写为聚合查询（COUNT/SUM/AVG/MAX/MIN/GROUP BY）；\n"
+            f"  2) 若用户确实要明细，请说明只展示了前 5 行，并建议加筛选条件或限定数量。\n"
+            f"  **不要**把上面的样例当成完整数据来汇报。"
+            f"{truncation_note}"
+        )
+
+
+# ==================== 全局单例 ====================
+
+_executor: Optional[SqlExecutor] = None
+
+
+def get_executor() -> SqlExecutor:
+    """进程级单例（避免每请求重建连接池）。"""
+    global _executor
+    if _executor is None:
+        _executor = SqlExecutor()
+    return _executor

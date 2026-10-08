@@ -34,9 +34,6 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 SQL_DIR = Path(__file__).resolve().parent / "sql"
-# 本地开发默认口令：仅用于演示库，角色只有 SELECT 权限，爆炸半径受限于业务数据。
-# 生产务必用 ANALYTICS_RO_PASSWORD 环境变量覆盖（见 .env.example）。
-_DEV_DEFAULT_RO_PASSWORD = "kb_ro_dev_pw"
 
 _POSTGRES_CONTAINER = "docker_setting-postgres-1"
 
@@ -54,8 +51,8 @@ def _analytics_engine() -> Engine:
 
 
 def effective_ro_password() -> str:
-    """只读角色的实际口令：配置优先，否则用本地开发默认值。"""
-    return settings.analytics_ro_password or _DEV_DEFAULT_RO_PASSWORD
+    """只读角色的实际口令：配置优先，否则用本地开发默认值（单一事实来源在 config）。"""
+    return settings.effective_ro_password
 
 
 def database_exists(engine: Engine, db_name: str) -> bool:

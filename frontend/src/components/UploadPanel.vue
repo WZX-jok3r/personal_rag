@@ -20,6 +20,7 @@ const error = ref("");
 const tasks = ref<Task[]>([]);
 const docs = ref<DocumentItem[]>([]);
 const deletingId = ref<number | null>(null);
+const deleteNotice = ref("");
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -42,11 +43,16 @@ async function onDelete(d: DocumentItem) {
   if (!ok) return;
   deletingId.value = d.id;
   error.value = "";
+  deleteNotice.value = "";
   try {
     const res = await api.deleteDocument(d.id);
     await refreshDocs();
-    // 若刚删的文档仍在本轮任务列表里（document_id 匹配），保留任务行仅供回看
-    void res;
+    // 把后端返回的清理明细展示出来；并提醒：已删文档的历史回答仍在会话记录里，不会自动失效
+    const vec = res.vectors_cleared ? "向量已清理" : "⚠ 未匹配到向量（可能本就不存在）";
+    const file = res.file_removed ? "物理副本已删除" : "物理副本此前已不存在";
+    deleteNotice.value =
+      `《${res.source}》已删除：${vec}，${file}。` +
+      "注意：当前会话的历史回答不会随之失效——如需验证删除效果，请点「＋ 新会话」后重新提问。";
   } catch (e) {
     error.value = (e as Error).message;
   } finally {
@@ -122,7 +128,10 @@ function close() {
 watch(
   () => props.open,
   (v) => {
-    if (v) refreshDocs();
+    if (v) {
+      deleteNotice.value = "";
+      refreshDocs();
+    }
   },
 );
 
@@ -179,6 +188,7 @@ function badgeClass(status: string) {
 
       <section class="docs">
         <h3>知识库已登记文档</h3>
+        <p v-if="deleteNotice" class="notice">{{ deleteNotice }}</p>
         <p v-if="docs.length === 0" class="empty">暂无文档</p>
         <ul>
           <li v-for="d in docs" :key="d.id" class="doc">
@@ -405,5 +415,16 @@ ul {
 .dim {
   font-size: 12px;
   color: var(--muted);
+}
+
+.notice {
+  font-size: 12px;
+  line-height: 1.5;
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.08);
+  border: 1px solid rgba(251, 191, 36, 0.25);
+  border-radius: 10px;
+  padding: 8px 10px;
+  margin: 0 0 10px;
 }
 </style>

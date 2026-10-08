@@ -300,7 +300,17 @@ class Text2SqlEngine:
 
             sql_call = _find_call(chat.tool_calls, "sql_query")
             if sql_call is None:
-                # 模型没调工具，只回了文本：可能是它认为问题不需要查库
+                # 模型没调工具，只回了文本。两种情况必须区分：
+                #   ① 它在**反问澄清**（即使我们给了 ask_clarification 工具，
+                #      实测模型有时仍直接用自由文本发问 —— 见下方 _looks_like_clarification）
+                #   ② 它认为问题不需要查库
+                # 若不区分，同一个澄清行为会时而被标成 clarify、时而被标成普通答案，
+                # 前端呈现与统计口径都不一致（实测复现率约 1/3）。
+                if _looks_like_clarification(chat.content):
+                    result.needs_clarification = True
+                    result.clarification = chat.content.strip()
+                    result.answer = result.clarification
+                    return result
                 result.answer = chat.content or "无法为这个问题生成数据查询。"
                 return result
 
@@ -389,6 +399,47 @@ def _find_call(calls: List[ToolCall], name: str) -> Optional[ToolCall]:
         if c.name == name:
             return c
     return None
+
+
+def _looks_like_clarification(content: str) -> bool:
+    """判断模型的自由文本回复是不是在"反问澄清口径"。
+
+    为什么需要这个启发式（实测驱动）：
+        我们给了 `ask_clarification` 工具，但实测模型有约 1/3 的概率
+        **不调工具**、直接用自由文本列出候选口径反问。
+        若不识别这种形态，同一个澄清行为会时而走 clarify 事件、
+        时而变成普通答案，前端口径不一致。
+
+    判据（**全部满足**才算，避免把正常答案误判为反问）：
+        1. 含疑问语气（问号 或 "请确认/请澄清/请说明/哪一种/是指"）
+        2. 出现**多个候选项**（编号列表 "1." / "2." / "1)"）或"或"/"还是"这类择一连接
+        3. 文本较短（< 400 字）—— 真正口径澄清不会长篇大论
+
+    保守设计：宁可漏判（当成普通答案），也不要把正常回答误判成反问
+    —— 因为误判会让用户收到一个"其实不需要回答的反问"。
+    """
+    if not content:
+        return False
+    text = content.strip()
+    if len(text) > 400:
+        return False
+
+    has_question_tone = (
+        "？" in text or "?" in text
+        or any(w in text for w in ("请确认", "请澄清", "请说明", "哪一种", "哪一类",
+                                   "是指", "需要先确认", "具体是什么意思"))
+    )
+    if not has_question_tone:
+        return False
+
+    # 多个候选项：编号列表或择一连接词
+    option_count = 0
+    for marker in ("1.", "2.", "3.", "1)", "2)", "3)", "1、", "2、", "3、", "①", "②"):
+        if marker in text:
+            option_count += 1
+    has_choice = option_count >= 2 or ("还是" in text) or ("或者" in text)
+
+    return has_choice
 
 
 def _append_retry(messages: List[Dict[str, Any]], bad_sql: str, error: str) -> List[Dict[str, Any]]:

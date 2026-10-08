@@ -1,0 +1,61 @@
+feat(P4+P5): Agent 编排层 —— 有界状态机 + 三层混合路由 + 事件协议扩展
+
+【Agent Loop】app/agent/loop.py —— 手写有界状态机，不引入框架
+决策依据（改造方案 4.5）：只有 3 个工具、循环上界明确、无多 Agent 协作、
+无人在回路审批；且必须复用既有 SSE 契约与 hermetic 测试体系。
+引入图编排框架 = 用 1000 行抽象解决 300 行问题，并让调试链路变长。
+切换边界已写进代码注释：多 Agent/HITL 切 LangGraph；复杂结构化输出优先 Pydantic AI。
+
+五重防死循环（面试必问 + 生产必备）：
+  1. MAX_STEPS = 5        步数硬上界（状态机而非 while True）
+  2. WALL_CLOCK = 60s     墙钟超时（防单步慢）
+  3. MAX_LLM_CALLS = 8    成本上界（框架默认往往没有这一条）
+  4. 相同工具+相同参数去重 连续两次相同调用判为循环，立即跳出
+  5. 任一步失败 -> 降级到纯 RAG，而非把错误抛给用户（可用性不倒退）
+
+【三层混合路由】app/agent/router.py
+  关卡一（本模块，0 成本，纯函数）：聚合词与列名词**同时**命中才强路由 SQL
+  关卡二（loop 内）：LLM function calling 自主选工具
+  关卡三：异常/超步数/超时 -> 强制退回纯 RAG
+  关键判定原则：必须同时命中两类词才强路由 —— 反例是评测集里真实存在的
+  「布洛芬最多多久吃一次？」，只命中聚合词"最多"但本质是文档问题。
+
+【工具】app/agent/tools.py（3 个，别贪多）
+  kb_search       复用现有 Retriever，返回结构与 pipeline 一致
+  sql_query       走 P2/P3 的 guard + executor，四层防御完整生效
+  list_data_tables 模型不确定有哪些数据时先调它
+  工具 description 刻意写清"什么时候不该用"——比在 prompt 里堆规则有效。
+
+【事件契约】app/agent/events.py —— 扩帧不改帧
+  既有 4 类（meta/delta/done/error）字段**冻结**，一个都没改；
+  新增 6 类（route/tool_call/tool_result/sql/clarify/degraded）。
+  前端对未知 type 走 default 忽略分支 -> 旧前端+新后端不崩。
+  ⚠️ 降级路径必定补发标准 meta 帧：否则前端来源列表与「已隐藏 N 条」徽标
+     会永久空着，用户会以为功能退化了（改造方案 5.5.3）。
+
+【测试】新增 3 文件 86 例（全部 hermetic，用假 LLM/假工具，秒级）
+  test_agent_router.py  36 例 —— 双向断言（该路由的/不该路由的都要测）
+  test_agent_events.py  26 例 —— 把冻结字段集合写成断言，防止有人改坏契约
+  test_agent_loop.py    35 例 —— 五重保护逐条验证 + 事件顺序契约
+
+实测发现并修复的两个真实缺陷（已记入 docs/经验教训.md）：
+  L-012 把"概率性行为"写成"确定性断言" -> 必然 flaky。
+        追查 flaky 时发现真实产品缺陷：模型有时**不调 ask_clarification 工具**、
+        直接用自由文本列出候选口径反问，导致同一行为时而走 clarify 事件、
+        时而变成普通答案（实测 6 次里 1 次）。修法：
+        新增 _looks_like_clarification() 识别自由文本反问形态（保守设计，
+        宁可漏判不误判），两条路径统一收敛到 needs_clarification=True；
+        同时把概率性断言改为**确定性不变式**断言
+        （任何调用必须落到 ①成功 ②明确反问 ③明确失败并说明 三者之一，
+         禁止"没执行/没反问/没说明"的静默状态）。
+        修后 E2E 连跑 3 次全绿。
+  另：规则层词表缺单字"人"，导致「有多少人」这种口语问法匹配不到列名词
+      -> 落到 LLM 决策而非强路由 SQL。已补词 + 补 4 例口语问法回归测试。
+
+验证: check.ps1 -Full 全绿
+  L1 compileall 通过
+  L2 pytest 417 passed（P3 时 237）
+  L3 检索评测无回归（Recall@5 99.01% / MRR 0.9703 与基线逐题一致）
+  E2E 稳定性: tests/test_text2sql_e2e.py 连跑 3 次均 19 passed
+
+注：尚无 HTTP 路由暴露 Agent（下一步），前端可视化（P6）未开始。

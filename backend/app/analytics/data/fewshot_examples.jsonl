@@ -1,0 +1,29 @@
+// Text2SQL few-shot 示例库（JSONL，每行一个 {"question","sql","note","tables"}）
+// 说明：这些 SQL 都已在真实库上验证可执行且结果正确。
+// 它们的作用是"教模型本项目的口径与风格"，而非覆盖所有问题 ——
+// 组合空间无法穷举，所以示例要精选"能示范一类写法"的，而不是穷举答案。
+{"question": "员工表有多少人？", "sql": "SELECT count(*) AS total FROM employees", "note": "总行数用 count(*)，取别名便于阅读", "tables": ["employees"]}
+{"question": "各部门分别有多少人？", "sql": "SELECT department, count(*) AS 人数 FROM employees GROUP BY department ORDER BY 人数 DESC", "note": "分组计数：GROUP BY 后必须 ORDER BY 便于阅读", "tables": ["employees"]}
+{"question": "哪个部门人数最多？", "sql": "SELECT department, count(*) AS 人数 FROM employees GROUP BY department ORDER BY count(*) DESC LIMIT 1", "note": "「最多/最少」类问题用 ORDER BY + LIMIT 1，不要用 MAX 去套分组计数", "tables": ["employees"]}
+{"question": "哪个部门人数最少？", "sql": "SELECT department, count(*) AS 人数 FROM employees GROUP BY department ORDER BY count(*) ASC LIMIT 1", "note": "「最少」用 ASC", "tables": ["employees"]}
+{"question": "全公司薪资最高的员工是谁？", "sql": "SELECT first_name, last_name, department, salary FROM employees ORDER BY salary DESC LIMIT 1", "note": "求「最高的人」要返回完整行信息，不要只返回 salary", "tables": ["employees"]}
+{"question": "薪资最低的员工是谁，在哪个部门？", "sql": "SELECT first_name, last_name, department, salary FROM employees ORDER BY salary ASC LIMIT 1", "note": "", "tables": ["employees"]}
+{"question": "薪资最高的前 5 名员工", "sql": "SELECT first_name, last_name, department, salary FROM employees ORDER BY salary DESC LIMIT 5", "note": "Top-N 用 LIMIT N", "tables": ["employees"]}
+{"question": "Sales 部门的平均薪资是多少？", "sql": "SELECT round(avg(salary), 2) AS avg_salary FROM employees WHERE department = 'Sales'", "note": "平均值用 avg() 并用 round 控制小数位；部门名区分大小写，用表里实际的取值", "tables": ["employees"]}
+{"question": "各部门的平均薪资，从高到低", "sql": "SELECT department, round(avg(salary), 2) AS avg_salary FROM employees GROUP BY department ORDER BY avg_salary DESC", "note": "分组求平均后排序，可以用别名排序", "tables": ["employees"]}
+{"question": "Sales 和 Engineering 两个部门各有多少人？相差多少人？", "sql": "SELECT department, count(*) AS 人数 FROM employees WHERE department IN ('Sales', 'Engineering') GROUP BY department ORDER BY department", "note": "两个部门做对比：用 IN 一次查出，再由结果自行相减；不要分两条 SQL", "tables": ["employees"]}
+{"question": "2026 年入职的员工有多少人？", "sql": "SELECT count(*) AS 人数 FROM employees WHERE hire_date >= '2026-01-01' AND hire_date < '2027-01-01'", "note": "年份筛选用半开区间 [年初, 次年年初)，比 EXTRACT 更易走索引", "tables": ["employees"]}
+{"question": "每年入职的人数分别是多少？", "sql": "SELECT extract(year FROM hire_date) AS 年份, count(*) AS 人数 FROM employees GROUP BY 1 ORDER BY 1", "note": "按年分组用 extract(year FROM ...)", "tables": ["employees"]}
+{"question": "薪资超过 15 万的人有多少？", "sql": "SELECT count(*) AS 人数 FROM employees WHERE salary > 150000", "note": "「超过 X 万」要换算成数字再比较", "tables": ["employees"]}
+{"question": "名字叫 Derek 的员工在哪个部门？", "sql": "SELECT first_name, last_name, department, salary FROM employees WHERE first_name = 'Derek'", "note": "按人名精确查找用 =，并返回部门等完整信息", "tables": ["employees"]}
+{"question": "各部门的平均薪资超过 14 万的有哪些？", "sql": "SELECT department, round(avg(salary), 2) AS avg_salary FROM employees GROUP BY department HAVING avg(salary) > 140000 ORDER BY avg_salary DESC", "note": "对聚合结果过滤必须用 HAVING，不能用 WHERE", "tables": ["employees"]}
+{"question": "每个部门薪资最高的员工是谁？", "sql": "SELECT department, first_name, last_name, salary FROM (SELECT department, first_name, last_name, salary, row_number() OVER (PARTITION BY department ORDER BY salary DESC) AS rn FROM employees) t WHERE rn = 1 ORDER BY salary DESC", "note": "「每组取最大」用窗口函数 row_number() OVER (PARTITION BY ... ORDER BY ...)，不要用 GROUP BY（会丢人员信息）", "tables": ["employees"]}
+{"question": "哪个产品的总营收最高？", "sql": "SELECT product, sum(revenue) AS 总营收 FROM sales GROUP BY product ORDER BY sum(revenue) DESC LIMIT 1", "note": "按产品汇总营收", "tables": ["sales"]}
+{"question": "每个产品的总销量是多少？", "sql": "SELECT product, sum(quantity) AS 总销量 FROM sales GROUP BY product ORDER BY 总销量 DESC", "note": "求和用 sum()", "tables": ["sales"]}
+{"question": "MegaPack 这个产品一共卖了多少单位？", "sql": "SELECT sum(quantity) AS 总销量 FROM sales WHERE product = 'MegaPack'", "note": "单个产品的累计用 sum() + WHERE", "tables": ["sales"]}
+{"question": "一共产生了多少营收？", "sql": "SELECT sum(revenue) AS 总营收 FROM sales", "note": "", "tables": ["sales"]}
+{"question": "费用一共花了多少？", "sql": "SELECT sum(amount) AS 总费用 FROM expenses", "note": "", "tables": ["expenses"]}
+{"question": "各类费用分别是多少？", "sql": "SELECT category, sum(amount) AS 金额 FROM expenses GROUP BY category ORDER BY 金额 DESC", "note": "", "tables": ["expenses"]}
+{"question": "哪一类费用最高？", "sql": "SELECT category, sum(amount) AS 金额 FROM expenses GROUP BY category ORDER BY 金额 DESC LIMIT 1", "note": "", "tables": ["expenses"]}
+{"question": "橱柜成本表里单价最贵的三个项目是什么？", "sql": "SELECT col_1, col_4 FROM cost_data WHERE col_4 IS NOT NULL ORDER BY col_4 DESC LIMIT 3", "note": "中文列名表用 col_N 引用；col_1=项目, col_4=单价(元)", "tables": ["cost_data"]}
+{"question": "橱柜成本各项小计一共多少钱？", "sql": "SELECT sum(col_4 * col_5) AS 合计 FROM cost_data WHERE col_4 IS NOT NULL AND col_5 IS NOT NULL", "note": "小计 = 单价 * 数量；注意先排除 NULL 再相乘", "tables": ["cost_data"]}

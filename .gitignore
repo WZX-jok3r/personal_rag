@@ -19,5 +19,6 @@ marker_out/
 _diag_qdrant.py
 
 
-# 临时提交信息文件（避免误入库；用 * 覆盖各种命名）
-*commitmsg*.tmp
+
+# 临时提交信息文件（避免误入库）
+*.tmp

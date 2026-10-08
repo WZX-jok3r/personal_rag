@@ -575,8 +575,8 @@ Satisfaction Score 为 4.8/5.0 的是哪个部门        → pdf-sample-a3.pdf
 > | **P5** 三层混合路由 | ✅ 完成 | 规则层纯函数可穷举单测；跨源问题交 LLM 工具选择 |
 > | **P5b** Agent HTTP 路由 | ✅ 完成 | `POST /agent/stream`、`POST /agent/route`；经 nginx 端到端验证通过 |
 > | **P6** 前端 Agent 可视化 | ✅ 完成 | 执行轨迹面板 + 通道徽标 + 模式切换；`npm run build` 通过 |
-> | **P7** 工程完备性 | 🟡 大部分完成 | ✅ GitHub Actions CI + ✅ 外部 API 重试 + ✅ **RBAC 角色与敏感列脱敏** + ✅ **SQL 审计表**；⏳ Prometheus 指标、结构化日志、会话 seq 竞态、备份对账 |
-> | **P8** 文档收口 | 🟡 部分完成 | ✅ 经验教训.md（14 条）+ 方案文档进度同步；⏳ README 重写、面试题扩充、演示视频 |
+> | **P7** 工程完备性 | ✅ 核心完成 | ✅ CI + ✅ 外部 API 重试 + ✅ RBAC 脱敏 + ✅ SQL 审计 + ✅ **LLM 成本记账** + ✅ **会话 seq 竞态修复**；⏳ Prometheus 指标聚合、结构化日志+trace_id、备份对账 |
+> | **P8** 文档收口 | ✅ 核心完成 | ✅ README 重写（RAG+Text2SQL 双引擎叙事）+ ✅ 经验教训.md（16 条）；⏳ 面试题扩充、演示视频 |
 >
 > **RBAC 实测**（P7）：
 > | 角色 | `SELECT id, first_name, email, department, salary FROM employees` 的结果 |
@@ -586,12 +586,16 @@ Satisfaction Score 为 4.8/5.0 的是哪个部门        → pdf-sample-a3.pdf
 >
 > 审计表同步记录：`('a:employee', True, 3, ['email','salary'])` / `('a:analyst', True, 3, None)`。
 > **向后兼容验证**：未配置 `RAG_TENANT_ROLES` 时全部走 `analyst`，脱敏只对非特权角色生效
-> ⇒ 不配置就等于没有这个功能，既有部署与 493 项测试零影响。
+> ⇒ 不配置就等于没有这个功能，既有部署与全部测试零影响。
+>
+> **成本记账实测**（P7）：一次 Agent 问答 → 19 次 LLM 调用 / 43501 tokens / 均 2289.5 tokens/次；
+> `GET /usage/sql` 报 `total=141 / succeeded=141 / redacted=3 / avg=3.3ms`。
 >
 > **当前质量门禁**（`scripts/check.ps1 -Full` 全绿）：
-> - **493 项单测通过**（改造前 45 项）
+> - **508 项单测通过**（改造前 45 项）
 > - 检索评测**零回归**：Recall@5 99.01% / MRR 0.9703，与基线**逐题一致**
-> - 改动规模：改造自 `baseline-p0` 起持续累积（详见 `git log baseline-p0..HEAD`）
+> - Text2SQL 评测：**EX 100%**（42/42）、Valid SQL Rate 100%、平均生成次数 1.00
+> - 改造规模：详见 `git log --oneline baseline-p0..HEAD`（13 个提交）
 >
 > **最关键的业务验证**：改造前 RAG 对「Sales 与 Engineering 各多少人、差多少」答 **1017**（错 31.8 倍），
 > 改造后 Agent 答 **32** 并展示执行的 SQL。

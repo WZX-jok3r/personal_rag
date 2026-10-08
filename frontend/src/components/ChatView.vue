@@ -30,14 +30,24 @@ watch(
 );
 
 
-async function onSend() {
-  const text = input.value;
-
+/** 真正发送消息（唯一入口） */
+async function send(text: string) {
   if (!text.trim() || chat.isLoading) return;
 
   input.value = "";
 
-  await chat.sendMessageStream(text);
+  // 按当前通道分发：agent 模式会额外产出执行轨迹与通道徽标
+  await chat.send(text);
+}
+
+/** 输入框/发送按钮的处理器：不接受参数（避免与 DOM 事件签名冲突） */
+async function onSubmit() {
+  await send(input.value);
+}
+
+/** 示例问题点击：带预设文本 */
+async function onSuggestion(text: string) {
+  await send(text);
 }
 
 
@@ -80,19 +90,36 @@ async function onNewSession() {
         基于你的个人知识库进行智能问答
       </p>
 
+      <!-- 通道切换：agent 模式会显示执行轨迹（走文档还是算数据一目了然） -->
+      <div class="mode-switch">
+        <button
+          :class="{ active: chat.mode === 'agent' }"
+          @click="chat.mode = 'agent'"
+        >
+          🤖 Agent 模式
+        </button>
+        <button
+          :class="{ active: chat.mode === 'legacy' }"
+          @click="chat.mode = 'legacy'"
+        >
+          💬 纯 RAG 模式
+        </button>
+      </div>
+
 
       <div class="suggestions">
 
-        <div class="suggestion">
-          📚 查询知识库内容
+        <!-- 这几条刻意覆盖三条不同路径：文档检索 / 数据统计 / 口径澄清 -->
+        <div class="suggestion" @click="onSuggestion('路由器的质保期是多久？')">
+          📚 文档：路由器的质保期是多久？
         </div>
 
-        <div class="suggestion">
-          💡 总结上传文档
+        <div class="suggestion" @click="onSuggestion('员工表里 Sales 部门和 Engineering 部门各有多少人？两者相差多少人？')">
+          📊 统计：两个部门各多少人、差多少？
         </div>
 
-        <div class="suggestion">
-          🔍 查找相关资料
+        <div class="suggestion" @click="onSuggestion('哪个部门人数最多？')">
+          📊 统计：哪个部门人数最多？
         </div>
 
       </div>
@@ -110,6 +137,10 @@ async function onNewSession() {
       :sources="m.sources"
       :hidden-count="m.hiddenCount"
       :streaming="m.streaming"
+      :trace="m.trace"
+      :channel="m.channel"
+      :clarify="m.clarify"
+      :stats="m.stats"
     />
 
 
@@ -132,7 +163,7 @@ async function onNewSession() {
         <span></span>
 
         <em>
-          AI 正在检索知识库...
+          {{ chat.mode === "agent" ? "Agent 正在分析并选择工具..." : "AI 正在检索知识库..." }}
         </em>
 
       </div>
@@ -207,7 +238,7 @@ async function onNewSession() {
         v-model="input"
         rows="2"
         placeholder="输入你的问题..."
-        @keydown.enter.exact.prevent="onSend"
+        @keydown.enter.exact.prevent="onSubmit"
       />
 
 
@@ -215,7 +246,7 @@ async function onNewSession() {
         v-if="!chat.isLoading"
         class="send"
         :disabled="!input.trim()"
-        @click="onSend"
+        @click="onSubmit"
       >
         🚀
       </button>
@@ -329,6 +360,70 @@ margin-top:30px;
 
 justify-content:center;
 
+flex-wrap:wrap;
+
+}
+
+
+
+/* 通道切换：Agent 模式展示执行轨迹，纯 RAG 模式为改造前的行为 */
+
+.mode-switch {
+
+display:flex;
+
+gap:8px;
+
+justify-content:center;
+
+margin-top:18px;
+
+}
+
+
+
+.mode-switch button {
+
+padding:7px 16px;
+
+border-radius:999px;
+
+border:1px solid var(--border);
+
+background:transparent;
+
+color:var(--text-muted,#6b7280);
+
+font-size:13px;
+
+cursor:pointer;
+
+transition:all .15s;
+
+}
+
+
+
+.mode-switch button:hover {
+
+border-color:#2563eb;
+
+color:#2563eb;
+
+}
+
+
+
+.mode-switch button.active {
+
+background:#2563eb;
+
+border-color:#2563eb;
+
+color:#fff;
+
+font-weight:600;
+
 }
 
 
@@ -344,6 +439,22 @@ border:1px solid var(--border);
 border-radius:18px;
 
 font-size:13px;
+
+cursor:pointer;
+
+transition:all .15s;
+
+}
+
+
+
+.suggestion:hover {
+
+border-color:#2563eb;
+
+color:#2563eb;
+
+transform:translateY(-1px);
 
 }
 

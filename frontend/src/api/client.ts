@@ -2,6 +2,8 @@
 // 开发期通过 Vite 代理，使用相对路径 /api/*（同源，免 CORS）
 
 import type {
+  AgentChatRequest,
+  AgentRouteInfo,
   ChatRequest,
   ChatResponse,
   DeleteDocumentResponse,
@@ -131,14 +133,63 @@ export async function chatStream(
     throw new Error(await readErrorMessage(resp));
   }
 
-  const reader = resp.body.getReader();
+  await consumeSse(resp.body, onEvent);
+}
+
+/**
+ * Agent 多轮对话的流式版本（SSE）：与 chatStream 同款解帧逻辑，
+ * 但走 /agent/stream，会额外收到 route / tool_call / tool_result / sql /
+ * clarify / degraded 六类轨迹事件（旧前端不认识会忽略，不会崩）。
+ */
+export async function agentStream(
+  payload: AgentChatRequest,
+  onEvent: (ev: StreamEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "text/event-stream",
+  };
+  const key = getApiKey();
+  if (key) headers["X-API-Key"] = key;
+
+  const resp = await fetch(`${BASE}/agent/stream`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(payload),
+    signal,
+  });
+
+  if (!resp.ok || !resp.body) {
+    throw new Error(await readErrorMessage(resp));
+  }
+  await consumeSse(resp.body, onEvent);
+}
+
+/** 规则路由调试：纯函数端点，不触发 LLM/数据库，用于排查"为什么走了这条路"。 */
+export function agentRoute(message: string): Promise<AgentRouteInfo> {
+  return request<AgentRouteInfo>("/agent/route", {
+    method: "POST",
+    body: JSON.stringify({ message }),
+  });
+}
+
+/**
+ * 共用 SSE 解帧：按 \n\n 切帧、取 data: 前缀、UTF-8 流式解码。
+ * 抽出来供 chatStream / agentStream 复用，避免两处解帧逻辑漂移
+ * （中文字节按流解码是踩过的坑：必须 TextDecoder(stream: true)）。
+ */
+async function consumeSse(
+  body: ReadableStream<Uint8Array>,
+  onEvent: (ev: StreamEvent) => void,
+): Promise<void> {
+  const reader = body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
     buf += decoder.decode(value, { stream: true });
-    // 按 SSE 帧分隔符 \n\n 切分，残留不足一帧的留在 buf 中
     let sep: number;
     while ((sep = buf.indexOf("\n\n")) !== -1) {
       const frame = buf.slice(0, sep);

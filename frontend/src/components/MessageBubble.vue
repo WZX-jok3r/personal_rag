@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import MarkdownIt from "markdown-it";
+import AgentTrace from "./AgentTrace.vue";
 import SourcesList from "./SourcesList.vue";
+import type { AgentStats, TraceStep } from "../api/types";
 
 const props = defineProps<{
   role: "user" | "assistant";
@@ -9,6 +11,14 @@ const props = defineProps<{
   sources?: any[];
   hiddenCount?: number;
   streaming?: boolean;
+  /** Agent 执行轨迹（agent 模式下有内容时渲染折叠面板） */
+  trace?: TraceStep[];
+  /** 回答依据的数据通道，用于在气泡上打标 */
+  channel?: "rag" | "sql" | "multi";
+  /** 口径澄清问句 */
+  clarify?: string;
+  /** Agent 运行统计 */
+  stats?: AgentStats;
 }>();
 
 
@@ -22,6 +32,23 @@ const md = new MarkdownIt({
 const rendered = computed(() =>
   md.render(props.content || "")
 );
+
+// 通道徽标：让用户一眼看出这条答案是"查文档"还是"算数据"得来的
+const channelBadge = computed(() => {
+  if (props.role !== "assistant") return "";
+  if (props.channel === "sql") return "📊 数据查询";
+  if (props.channel === "multi") return "🔀 文档+数据";
+  if (props.channel === "rag") return "📚 文档检索";
+  return "";
+});
+
+const statsText = computed(() => {
+  const s = props.stats;
+  if (!s) return "";
+  const parts = [`${s.steps} 步`, `${s.llm_calls} 次模型调用`, `${(s.elapsed_ms / 1000).toFixed(1)}s`];
+  if (s.degraded) parts.push(`已降级(${s.degraded_reason})`);
+  return parts.join(" · ");
+});
 
 </script>
 
@@ -61,25 +88,40 @@ const rendered = computed(() =>
       <strong>
         {{
           props.role === "assistant"
-          ? "RAG Assistant"
+          ? "知识库 Agent"
           : "You"
         }}
       </strong>
 
+      <span v-if="channelBadge" class="channel-badge">{{ channelBadge }}</span>
 
       <span v-if="props.streaming">
-        正在生成...
+        正在处理...
       </span>
 
 
     </div>
 
 
+    <!-- Agent 执行轨迹（折叠） -->
+    <AgentTrace
+      v-if="props.role === 'assistant' && props.trace && props.trace.length"
+      :steps="props.trace"
+      :collapsed="true"
+    />
 
     <div
       class="markdown"
       v-html="rendered"
     />
+
+    <!-- 口径澄清提示：这类回答不是答案，需要用户补充信息 -->
+    <div v-if="props.clarify" class="clarify-hint">
+      💬 请补充统计口径后我再查询
+    </div>
+
+    <!-- 运行统计（成本/步数可观测） -->
+    <div v-if="statsText" class="agent-stats">{{ statsText }}</div>
 
 
 
@@ -214,6 +256,62 @@ opacity:.8;
 .message-header span {
 
 font-size:12px;
+
+}
+
+
+
+/* 通道徽标：一眼看出答案来自"查文档"还是"算数据" */
+
+.channel-badge {
+
+padding:2px 8px;
+
+border-radius:999px;
+
+background:rgba(37,99,235,.12);
+
+color:#2563eb;
+
+font-weight:600;
+
+font-size:11px !important;
+
+margin-left:8px;
+
+margin-right:auto;
+
+}
+
+
+
+.agent-stats {
+
+margin-top:8px;
+
+font-size:11px;
+
+color:var(--text-muted,#9ca3af);
+
+}
+
+
+
+.clarify-hint {
+
+margin-top:10px;
+
+padding:8px 10px;
+
+border-radius:8px;
+
+background:rgba(245,158,11,.12);
+
+color:#b45309;
+
+font-size:12.5px;
+
+font-weight:500;
 
 }
 

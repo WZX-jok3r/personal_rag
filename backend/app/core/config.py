@@ -66,6 +66,7 @@ class Settings(BaseSettings):
     retrieval_mode: str = "hybrid"            # vector | hybrid
     prefetch_k: int = 20
     hybrid_tokenize: bool = True              # jieba 预分词，未装自动降级
+    index_filename_prefix: bool = True        # 入库时块文本头部注入文档名（BM25/rerank 对称可见，问题点名文件名时可精确命中；改动需全量重灌生效）
 
     # ==================== Rerank 精排 ====================
     rerank_enabled: bool = True

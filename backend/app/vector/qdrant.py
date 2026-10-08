@@ -56,10 +56,14 @@ _ASCII_RUN_RE = re.compile(r"[A-Za-z0-9]+(?:[.\-_/][A-Za-z0-9]+)*")
 def tokenize_for_bm25(text: str) -> str:
     """
     为 BM25 稀疏通道做预分词（入库与查询必须对称调用）：
-    - 先保护英数串（PS-12V-1.5A、BHG-24667 等）整体成 token
+    - 先把 Unicode 破折号（U+2011 非断行连字符/en-dash/em-dash）归一为 ASCII '-'：
+      否则 "docx‑sample‑..." 这类题面会被拆成 docx/sample 碎 token，与文档名整 token 失配
+    - 再保护英数串（PS-12V-1.5A、BHG-24667 等）整体成 token
     - 其余中文段用 jieba 切词
-    - jieba 未安装或开关关闭时直接返回原文
+    - jieba 未安装或开关关闭时直接返回归一化后的原文
     """
+    # 破折号归一：与评测器 normalize_source_name 同口径，对称作用于入库/查询两侧
+    text = text.replace("\u2011", "-").replace("\u2013", "-").replace("\u2014", "-")
     if not _JIEBA_AVAILABLE or not settings.hybrid_tokenize:
         return text
 

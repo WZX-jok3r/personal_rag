@@ -47,6 +47,30 @@ class SessionRepository(BaseRepository):
         return True
 
     # ---------- 消息 ----------
+    async def lock_session(self, session_id: str) -> None:
+        """对同一会话加**事务级 advisory lock**，串行化并发追加。
+
+        为什么需要它（真实竞态）：
+            `append` 的写入序列是「SELECT max(seq) -> INSERT seq+1」——
+            典型的 read-modify-write。同一 session 两个并发请求（例如双标签页、
+            或 Agent 的多步写入）会算出**同一个 seq**，撞
+            `unique(session_id, seq)` 约束，后到的那个直接报错。
+            这也是改造方案「不足」清单里列出的既有技术债（B5）。
+
+        为什么用 advisory lock 而不是改 schema：
+            - `SELECT ... FOR UPDATE` 对「尚无消息的新会话」无效（没有行可锁）；
+            - 加序列表/DB 序列需要迁移，且要处理历史数据回填；
+            - advisory lock 是**零迁移**方案：pg_advisory_xact_lock 在事务结束时
+              自动释放（不会泄漏），无需 try/finally。
+            - 锁粒度是 session_id 哈希 ⇒ **不同会话完全并行**，不损吞吐。
+
+        注意：`hashtext` 是 PG 内置函数，把字符串稳定映射成 int4。
+            偶发哈希碰撞只会让两个不同会话短暂串行（正确性不受影响）。
+        """
+        await self._session.execute(
+            select(func.pg_advisory_xact_lock(func.hashtext(session_id)))
+        )
+
     async def next_seq(self, session_id: str) -> int:
         stmt = select(func.coalesce(func.max(Message.seq), 0)).where(
             Message.session_id == session_id

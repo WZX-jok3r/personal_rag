@@ -65,11 +65,17 @@ class SessionService:
         return history
 
     async def append(self, session_id: str, tenant_id: Optional[str], message: Dict[str, str]) -> None:
-        """追加一条干净消息（role/content）。会话不存在或租户不符则静默跳过（对齐内存实现）。"""
+        """追加一条干净消息（role/content）。会话不存在或租户不符则静默跳过（对齐内存实现）。
+
+        并发安全：整段「取 seq -> 插入 -> 续期」在**同一事务**内并持有
+        会话级 advisory lock，避免同一 session 的并发追加算出重复 seq 撞唯一约束
+        （见 SessionRepository.lock_session 的说明）。
+        """
         if not await self.exists(session_id, tenant_id):
             return
         async with self._sm() as s:
             repo = SessionRepository(s)
+            await repo.lock_session(session_id)
             seq = await repo.next_seq(session_id)
             await repo.add_message(session_id, message["role"], message["content"], seq)
             await repo.touch(session_id)

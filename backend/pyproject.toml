@@ -36,6 +36,12 @@ dependencies = [
     # 缓存 / 队列（P3 + P4）
     "redis>=5.0.0",
     "arq>=0.26",
+    # Text2SQL 安全（P2）：SQL AST 白名单校验 + 标识符转义 + LIMIT 注入
+    # 选型理由：MIT、零依赖纯 Python、Postgres 属 Official 支持级别；
+    # 且自带内存执行引擎（sqlglot.executor），可让 SQL 单测不依赖 PostgreSQL。
+    # ⚠️ 官方 FAQ 明确声明 "SQLGlot is a transpiler, not a validator"，
+    #    因此它只是四层防御中的第一层，不能作为唯一安全边界。
+    "sqlglot>=30.0.0",
     # 可观测
     "langfuse>=3.0.0",
 ]

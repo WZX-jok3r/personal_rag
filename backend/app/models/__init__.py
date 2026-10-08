@@ -4,6 +4,7 @@
 `database.create_all` 与 `alembic --autogenerate` 都依赖此处完成模型注册。
 """
 
+from app.models.analytics import AnalyticsColumn, AnalyticsTable
 from app.models.base import Base, TimestampMixin
 from app.models.chat import ChatSession, Message
 from app.models.document import Document, DocumentStatus
@@ -20,4 +21,6 @@ __all__ = [
     "DocumentStatus",
     "IngestTask",
     "TaskStatus",
+    "AnalyticsTable",
+    "AnalyticsColumn",
 ]

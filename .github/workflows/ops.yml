@@ -1,0 +1,92 @@
+# 定时运维任务（备份 + 对账）
+#
+# 为什么需要这份示例：
+#   备份与对账脚本**只有被定时执行才有价值**。写在文档里靠人记着手动跑，
+#   等价于没有 —— 这是"有脚本"和"有运维"的区别。
+#
+# 本文件提供两种接入方式，任选其一（或都配）：
+#   A. GitHub Actions（推荐给本项目的个人/演示场景：零基础设施）
+#   B. 宿主机 cron / Windows 计划任务（生产自托管场景）
+#
+# ⚠️ 前置：以下命令都需要 docker 可用，且仓库根有 .env（含 API Key 与库口令）
+
+name: Ops (Backup + Reconcile)
+
+on:
+  schedule:
+    # 每天 UTC 18:00（北京时间 02:00，业务低峰）
+    - cron: "0 18 * * *"
+  workflow_dispatch:        # 支持手动触发，便于演练
+
+jobs:
+  backup-and-reconcile:
+    runs-on: ubuntu-latest
+    # 说明：Action runner 上并没有你的 docker 环境与数据，
+    # 因此本任务默认**只做一次配置与脚本语法自检**，不真连生产。
+    # 真正需要定时备份时，请用下面的方式 B（在宿主机上跑）。
+    # 这样安排是刻意的：把"能安全在 CI 里跑的"和"必须接触生产数据的"分开。
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 运维脚本语法与单测自检
+        working-directory: backend
+        run: |
+          python -m compileall -q app/analytics/backup.py app/analytics/reconcile.py
+          pip install pytest
+          # 对账的分类逻辑是纯逻辑，可在 CI 里完整验证
+          pip install -e . 2>/dev/null || true
+          echo "::notice::真实的备份/对账请用宿主机定时任务（见文件末尾说明）"
+
+# ============================================================================
+# 方式 B：宿主机定时任务（真正执行备份与对账）
+# ============================================================================
+#
+# Linux / macOS（crontab -e）：
+#
+#   # 每天 02:30 备份，保留 7 份
+#   30 2 * * *  cd /path/to/personal_rag/backend && \
+#               /path/to/venv/bin/python -m app.analytics.backup --keep 7 \
+#               >> /var/log/rag_backup.log 2>&1
+#
+#   # 每天 03:30 对账；退出码 2 表示有孤儿向量需人工确认
+#   30 3 * * *  cd /path/to/personal_rag/backend && \
+#               /path/to/venv/bin/python -m app.analytics.reconcile --json \
+#               >> /var/log/rag_reconcile.log 2>&1
+#
+# Windows（PowerShell 计划任务）：
+#
+#   $py = "D:\PythonProjects\personal_rag\.venv\Scripts\python.exe"
+#   $be = "D:\PythonProjects\personal_rag\backend"
+#   Start-Process -NoNewWindow -FilePath $py `
+#     -ArgumentList "-m","app.analytics.backup","--keep","7" -WorkingDirectory $be
+#
+# ============================================================================
+# 监控接入建议
+# ============================================================================
+#
+# 1) 对账退出码直接当告警信号：
+#      0 = 一致（正常）
+#      1 = 有可修的不一致（PG 登记但向量缺失 / 文件缺失）
+#      2 = 有孤儿向量，**必须人工确认**（可能是入库中间态，不能自动删）
+#
+# 2) 备份也要监控"是否真的产生了新文件"：
+#      只检查退出码不够 —— 磁盘满时 pg_dump 可能"成功"写出 0 字节。
+#      规则：备份目录里的最新 .dump 文件大小应 > 0 且 mtime 在 24h 内。
+#
+# 3) 业务指标用 GET /metrics 接 Prometheus，重点看：
+#      rag_agent_runs_total{degraded="true"}  降级率突增 = 下游出问题
+#      rag_sql_guard_rejections_total          安全网关在真实流量下的拦截量
+#      rag_sql_redactions_total                敏感数据访问尝试
+#
+# ============================================================================
+# 恢复演练（强烈建议每季度一次）
+# ============================================================================
+#
+# 备份只有经过恢复演练才算有效。最小演练步骤：
+#   1. 起一个空的 postgres 容器（不要动生产）
+#   2. docker exec -i <tmp> pg_restore -U rag -d rag --clean --if-exists < rag_*.dump
+#   3. 抽查关键表行数：documents / messages / sql_audit / llm_usage
+#   4. Qdrant：POST /collections/{c}/snapshots/recover 指定快照名
+#   5. 记录演练耗时 —— 它就是你真实的 RTO

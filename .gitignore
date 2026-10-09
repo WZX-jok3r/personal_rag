@@ -1,10 +1,14 @@
 .env
 processed_cache/ 
-qdrant_storage/ 
-__pycache__/ 
-*.pyc 
-venv/ 
-rag_py311/ 
+qdrant_storage/
+pgdata/
+redisdata/ 
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.egg-info/
+rag_py311/
 
 # IDE / 本地工具
 .idea/
@@ -13,3 +17,11 @@ rag_py311/
 output/
 marker_out/
 _diag_qdrant.py
+
+
+
+# 临时提交信息文件（避免误入库）
+*.tmp
+
+# 备份产物（含数据库 dump，体积大且含数据，绝不入库）
+backups/

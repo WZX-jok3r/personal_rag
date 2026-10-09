@@ -1,0 +1,64 @@
+// Text2SQL 评测集（中文 NL2SQL）
+//
+// 指标口径：**Execution Accuracy (EX)** —— 执行「生成 SQL」与执行「Gold SQL」，
+// 结果集相同即算对。比字符串匹配合理得多（同一语义有多种写法）。
+//
+// 每条字段：
+//   question   自然语言问题
+//   gold_sql   参考 SQL（已在真实库验证可执行）
+//   ordered    结果是否有序（true 时按行序严格比较；false 时做无序集合比较）
+//   category   分类，便于出分类统计
+//
+// 数据集刻意覆盖容易出错的类型：
+//   分组聚合 / Top-N / 差值 / 日期区间 / 每组取最大 / 中文列名 / 明细查询
+
+{"question": "员工表里一共有多少员工？", "gold_sql": "SELECT count(*) FROM employees", "ordered": false, "category": "基础计数"}
+{"question": "Sales 部门有多少人？", "gold_sql": "SELECT count(*) FROM employees WHERE department = 'Sales'", "ordered": false, "category": "条件计数"}
+{"question": "2026 年入职的员工有多少人？", "gold_sql": "SELECT count(*) FROM employees WHERE hire_date >= '2026-01-01' AND hire_date < '2027-01-01'", "ordered": false, "category": "日期区间"}
+{"question": "薪资超过 15 万的员工有多少人？", "gold_sql": "SELECT count(*) FROM employees WHERE salary > 150000", "ordered": false, "category": "条件计数"}
+{"question": "一共有多少个不同的部门？", "gold_sql": "SELECT count(DISTINCT department) FROM employees", "ordered": false, "category": "去重计数"}
+
+{"question": "Sales 部门和 Engineering 部门各有多少人？", "gold_sql": "SELECT department, count(*) FROM employees WHERE department IN ('Sales','Engineering') GROUP BY department", "ordered": false, "category": "分组对比"}
+{"question": "各部门分别有多少人？", "gold_sql": "SELECT department, count(*) FROM employees GROUP BY department", "ordered": false, "category": "分组聚合"}
+{"question": "每个部门的平均薪资是多少？", "gold_sql": "SELECT department, round(avg(salary), 2) FROM employees GROUP BY department", "ordered": false, "category": "分组聚合"}
+{"question": "每个部门薪资最高的人拿多少钱？", "gold_sql": "SELECT department, max(salary) FROM employees GROUP BY department", "ordered": false, "category": "分组聚合"}
+{"question": "每个部门的人数从多到少排列", "gold_sql": "SELECT department, count(*) FROM employees GROUP BY department ORDER BY count(*) DESC", "ordered": true, "category": "分组排序"}
+
+{"question": "哪个部门人数最多？", "gold_sql": "SELECT department FROM employees GROUP BY department ORDER BY count(*) DESC LIMIT 1", "ordered": false, "category": "Top-N"}
+{"question": "哪个部门人数最少？", "gold_sql": "SELECT department FROM employees GROUP BY department ORDER BY count(*) ASC LIMIT 1", "ordered": false, "category": "Top-N"}
+{"question": "全公司薪资最高的员工是谁？", "gold_sql": "SELECT first_name, last_name FROM employees ORDER BY salary DESC LIMIT 1", "ordered": false, "category": "Top-N"}
+{"question": "薪资最低的员工叫什么名字？", "gold_sql": "SELECT first_name, last_name FROM employees ORDER BY salary ASC LIMIT 1", "ordered": false, "category": "Top-N"}
+{"question": "薪资最高的前 3 名员工是谁？", "gold_sql": "SELECT first_name, last_name FROM employees ORDER BY salary DESC LIMIT 3", "ordered": true, "category": "Top-N"}
+{"question": "薪资最高的员工在哪个部门？", "gold_sql": "SELECT department FROM employees ORDER BY salary DESC LIMIT 1", "ordered": false, "category": "Top-N"}
+
+{"question": "全公司薪资总和是多少？", "gold_sql": "SELECT sum(salary) FROM employees", "ordered": false, "category": "聚合求和"}
+{"question": "全公司平均薪资是多少？", "gold_sql": "SELECT round(avg(salary), 2) FROM employees", "ordered": false, "category": "聚合求平均"}
+{"question": "薪资最高和最低分别是多少？", "gold_sql": "SELECT max(salary), min(salary) FROM employees", "ordered": false, "category": "聚合极值"}
+{"question": "Sales 部门的平均薪资是多少？", "gold_sql": "SELECT round(avg(salary), 2) FROM employees WHERE department = 'Sales'", "ordered": false, "category": "条件聚合"}
+
+{"question": "名字叫 Derek 的员工在哪个部门？", "gold_sql": "SELECT department FROM employees WHERE first_name = 'Derek'", "ordered": false, "category": "明细查询"}
+{"question": "工号 42 的员工叫什么名字？", "gold_sql": "SELECT first_name, last_name FROM employees WHERE id = 42", "ordered": false, "category": "明细查询"}
+{"question": "Operations 部门有多少人？", "gold_sql": "SELECT count(*) FROM employees WHERE department = 'Operations'", "ordered": false, "category": "条件计数"}
+{"question": "Finance 部门的人数是多少？", "gold_sql": "SELECT count(*) FROM employees WHERE department = 'Finance'", "ordered": false, "category": "条件计数"}
+
+{"question": "销售流水一共有多少条记录？", "gold_sql": "SELECT count(*) FROM sales", "ordered": false, "category": "跨表-销售"}
+{"question": "销售总营收是多少？", "gold_sql": "SELECT sum(revenue) FROM sales", "ordered": false, "category": "跨表-销售"}
+{"question": "哪个产品的总营收最高？", "gold_sql": "SELECT product FROM sales GROUP BY product ORDER BY sum(revenue) DESC LIMIT 1", "ordered": false, "category": "跨表-销售"}
+{"question": "MegaPack 一共卖了多少单位？", "gold_sql": "SELECT sum(quantity) FROM sales WHERE product = 'MegaPack'", "ordered": false, "category": "跨表-销售"}
+{"question": "每个产品的销量分别是多少？", "gold_sql": "SELECT product, sum(quantity) FROM sales GROUP BY product", "ordered": false, "category": "跨表-销售"}
+{"question": "费用支出一共多少钱？", "gold_sql": "SELECT sum(amount) FROM expenses", "ordered": false, "category": "跨表-费用"}
+{"question": "哪一类费用支出最高？", "gold_sql": "SELECT category FROM expenses GROUP BY category ORDER BY sum(amount) DESC LIMIT 1", "ordered": false, "category": "跨表-费用"}
+{"question": "各类费用分别是多少？", "gold_sql": "SELECT category, sum(amount) FROM expenses GROUP BY category", "ordered": false, "category": "跨表-费用"}
+
+{"question": "橱柜成本明细表里有多少条记录？", "gold_sql": "SELECT count(*) FROM cost_data", "ordered": false, "category": "中文列名表"}
+{"question": "橱柜成本里单价最高的项目是哪个？", "gold_sql": "SELECT col_1 FROM cost_data WHERE col_4 IS NOT NULL ORDER BY col_4 DESC LIMIT 1", "ordered": false, "category": "中文列名表"}
+{"question": "橱柜成本里单价最贵的三个项目是什么？", "gold_sql": "SELECT col_1 FROM cost_data WHERE col_4 IS NOT NULL ORDER BY col_4 DESC LIMIT 3", "ordered": true, "category": "中文列名表"}
+{"question": "橱柜成本表里数量最多的是哪个项目？", "gold_sql": "SELECT col_1 FROM cost_data WHERE col_5 IS NOT NULL ORDER BY col_5 DESC LIMIT 1", "ordered": false, "category": "中文列名表"}
+
+{"question": "每年入职的人数分别是多少？", "gold_sql": "SELECT extract(year FROM hire_date), count(*) FROM employees GROUP BY 1", "ordered": false, "category": "日期分组"}
+{"question": "2020 年入职的有多少人？", "gold_sql": "SELECT count(*) FROM employees WHERE hire_date >= '2020-01-01' AND hire_date < '2021-01-01'", "ordered": false, "category": "日期区间"}
+{"question": "入职最早的那位员工是谁？", "gold_sql": "SELECT first_name, last_name FROM employees ORDER BY hire_date ASC LIMIT 1", "ordered": false, "category": "Top-N"}
+
+{"question": "薪资高于全公司平均薪资的人有多少？", "gold_sql": "SELECT count(*) FROM employees WHERE salary > (SELECT avg(salary) FROM employees)", "ordered": false, "category": "子查询"}
+{"question": "每个部门薪资最高的那个人的薪资是多少？", "gold_sql": "SELECT department, max(salary) FROM employees GROUP BY department", "ordered": false, "category": "分组聚合"}
+{"question": "各个部门里薪资最高的人是哪位？", "gold_sql": "SELECT department, first_name, last_name, salary FROM (SELECT department, first_name, last_name, salary, row_number() OVER (PARTITION BY department ORDER BY salary DESC) AS rn FROM employees) t WHERE rn = 1", "ordered": false, "category": "窗口函数"}

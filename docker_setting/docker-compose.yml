@@ -1,4 +1,3 @@
-version: '3.8'
 services:
   qdrant:
     image: qdrant/qdrant:latest
@@ -8,4 +7,121 @@ services:
       - ./qdrant_storage:/qdrant/storage
     environment:
       - QDRANT__SERVICE__HTTP_PORT=6333
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=rag
+      - POSTGRES_PASSWORD=rag
+      - POSTGRES_DB=rag
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ---- 一次性迁移：建表后退出（backend/worker 等它成功再启动）----
+  migrate:
+    image: personal-rag-backend:local
+    env_file: ../.env
+    # 容器内基础设施一律用服务名覆盖根 .env 里的 localhost 默认
+    environment:
+      POSTGRES_HOST: postgres
+      QDRANT_HOST: qdrant
+      REDIS_URL: redis://redis:6379/0
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ---- API：唯一负责 build 后端镜像的服务，migrate/worker 复用同一 tag ----
+  backend:
+    image: personal-rag-backend:local
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    env_file: ../.env
+    environment:
+      POSTGRES_HOST: postgres
+      QDRANT_HOST: qdrant
+      REDIS_URL: redis://redis:6379/0
+    # 上传落盘目录需与 worker 共享（同一宿主机目录）
+    volumes:
+      - ../knowledge_base:/knowledge_base
+      - ../processed_cache:/processed_cache
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ---- ARQ 入库 worker：同镜像、不同命令，无独立端口 ----
+  worker:
+    image: personal-rag-backend:local
+    env_file: ../.env
+    environment:
+      POSTGRES_HOST: postgres
+      QDRANT_HOST: qdrant
+      REDIS_URL: redis://redis:6379/0
+    command: ["arq", "app.worker.settings.WorkerSettings"]
+    # worker 复用后端镜像但不跑 API，关掉为 API 写的健康检查避免误判
+    healthcheck:
+      disable: true
+    volumes:
+      - ../knowledge_base:/knowledge_base
+      - ../processed_cache:/processed_cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ---- 前端：nginx 托管 dist + 同源反代 /api/v1 -> backend:8000（SSE 关缓冲）----
+  frontend:
+    image: personal-rag-frontend:local
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      # 构建期烘入默认租户 Key（演示免手动填写）；需切换时用环境变量覆盖：
+      #   $env:VITE_RAG_API_KEY="<其他租户的 key>"; docker compose build frontend
+      # 注意：前端 getApiKey 优先读 localStorage，浏览器里旧值会覆盖烘入值，以 UI 设置框为准。
+      args:
+        VITE_RAG_API_KEY: ${VITE_RAG_API_KEY:-abc_wzx11}
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
     restart: unless-stopped

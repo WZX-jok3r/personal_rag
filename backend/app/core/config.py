@@ -163,6 +163,10 @@ class Settings(BaseSettings):
     sql_inline_max_rows: int = 50
     # LLM 生成 SQL 失败后，允许带错误信息重写的最多次数
     sql_max_retry: int = 2
+    # 入库时是否把表格类文件（xlsx）同步成 SQL 表，实现 RAG + Text2SQL 双通道。
+    # 设计文档要求「复用异步入库链路把表格转表做成 ARQ 任务」；
+    # 关闭它则只走 RAG（xlsx 不会出现在 SQL 侧），便于对照与排障。
+    analytics_sync_on_ingest: bool = True
 
     # ==================== Redis（缓存 / 会话 / ARQ 队列，P3+P4 起启用）====================
     redis_url: str = "redis://localhost:6379/0"

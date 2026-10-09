@@ -171,6 +171,10 @@ class AgentLoop:
         yield ev.ev_tool_call(call_id, "list_data_tables", {}, purpose="确认可用数据表")
         listing = self._exec_tool(state, "list_data_tables", {}, tenant_id, deadline)
         if listing is not None:
+            # 记进 state.tool_calls：它是"实际工作量"的度量口径，
+            # 漏记会让 rag_agent_tool_calls 少算一次（_exec_tool 内部只记 outcome，
+            # 由调用方负责累计到 state）。
+            state.tool_calls.append({"name": "list_data_tables", "ok": True})
             yield listing
 
         # 用 Text2SQL 引擎生成并执行（它内部含 schema linking + few-shot + 自修正）
@@ -422,8 +426,18 @@ class AgentLoop:
     def _record_metrics(self, state: AgentState) -> None:
         """把本次运行写入 Prometheus 指标。
 
-        记录 route 与 degraded：前者用于看"各通道占比"（规则路由是否在起作用），
-        后者是**可用性告警的核心指标** —— 降级率突然升高说明下游出了问题。
+        记录三类信息：
+          - `route` / `degraded`：各通道占比 + **降级率**（可用性告警核心指标）
+          - `rag_agent_steps`：LLM 工具选择循环的轮次（成本相关）
+          - `rag_agent_tool_calls`：实际工具调用次数（**真实工作量**）
+
+        ⚠️ 为什么必须同时记 tool_calls（实测发现的缺口）：
+            `steps` 只在 `_run_llm_loop` 里自增，而**规则强路由路径不进入那个循环**
+            —— 于是"哪个部门人数最多"这类被 router 直接判定为 SQL 的问题，
+            `steps` 恒为 0，可它实际调用了 list_data_tables + sql_query 两次工具。
+            只看 steps 会得出"Agent 什么都没做"的错误结论。
+            两个指标一起看才有意义：steps=0 且 tool_calls=2 ⇒ 规则路由生效（好事）。
+
         指标写入失败不影响主流程。
         """
         try:
@@ -433,6 +447,7 @@ class AgentLoop:
             counter_inc("rag_agent_runs_total",
                         (route, "true" if state.degraded else "false"))
             observe("rag_agent_steps", float(state.steps))
+            observe("rag_agent_tool_calls", float(len(state.tool_calls)))
         except Exception:  # noqa: BLE001
             pass
 

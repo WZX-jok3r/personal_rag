@@ -83,12 +83,23 @@ def observe(name: str, value: float, labels: Sequence[str] = ()) -> None:
     否则 `rag_agent_steps`（分桶 1..10）会按延迟分桶（0.01..60）统计，
     导致所有观测都落在第一个桶里，指标静默失真。
 
-    ⚠️⚠️ `counts` 刻意用**普通 dict** 而不是 `defaultdict`：
-        `defaultdict.get(missing, 0)` 会**顺手插入**这个缺失的键（Python 经典陷阱）。
-        若用 defaultdict，第一次 observe(3.0) 就会给所有"≤ 判定为假"的桶
-        插入 0 值条目，渲染时遍历 counts 就会输出一堆本不存在的桶 ——
-        实测表现为 le=3..6 的桶值 1,2,3,5 而 _count 只有 2，**指标静默失真**。
-        用普通 dict 则 `counts[b] = counts.get(b, 0) + 1` 只写显式命中的桶。
+    ⚠️⚠️ **只累加命中的那一个桶**（`value <= b` 中**最小**的 b），
+        累计由 render() 负责。这是本模块最容易写错的地方，见下方说明。
+
+    ## 为什么必须"存原始计数、渲染时再累计"（一次真实事故）
+
+    初版写成「observe 时把所有 `value <= b` 的桶都 +1」（即 observe 侧就做累计），
+    而 render() 又对 `counts` 做了一次前缀和 —— **累计了两次**。
+    后果（实测，3 次观测）：
+        _count = 3，+Inf = 3，但最后一个桶 = 20
+        桶值随观测数**二次增长**，完全不是计数
+    这违反 Prometheus exposition format：`_bucket{le=X}` 必须是
+    「观测值 ≤ X 的**次数**」。`histogram_quantile()` 依赖该前提，
+    喂给它这种序列会算出**无意义的 P95**，而且是静默的（指标照常有输出）。
+
+    顺带说明：初版当时被"验证通过"过一次，但那次验证脚本本身就是错的 ——
+    它复刻了 observe 的**错误逻辑**再和导出结果比，等于自己和自己比。
+    参见 docs/经验教训.md L-017 的更正。
     """
     key = tuple(str(x) for x in labels)
     buckets = _BUCKETS.get(name, list(LATENCY_BUCKETS))
@@ -101,9 +112,12 @@ def observe(name: str, value: float, labels: Sequence[str] = ()) -> None:
         entry["sum"] += float(value)
         entry["count"] += 1
         counts = entry["counts"]
+        # 只落进"能容纳它的最小桶"。若超出所有桶，则不落任何桶
+        # （+Inf 桶由 render 用 _count 输出，天然覆盖这种情况）。
         for b in buckets:
             if value <= b:
                 counts[b] = counts.get(b, 0) + 1
+                break
 
 
 def _escape(v: object) -> str:
@@ -180,7 +194,14 @@ register_histogram("rag_http_request_duration_seconds", "HTTP 请求耗时（秒
 register_counter("rag_agent_runs_total",
                  "Agent 运行次数（route=实际通道，degraded=是否降级）",
                  ("route", "degraded"))
-register_histogram("rag_agent_steps", "Agent 执行步数分布", (), STEPS_BUCKETS)
+register_histogram("rag_agent_steps", "Agent LLM 工具选择循环的轮次分布", (), STEPS_BUCKETS)
+# 为什么还需要单独一个 tool_calls 指标（实测得出的教训）：
+#   `steps` 只统计 LLM 工具选择循环的轮次，而**规则强路由路径根本不进那个循环**
+#   （它由 router 直接决定通道），于是那条路径的 steps 恒为 0 ——
+#   可它明明做了「读表清单 + 执行 SQL」两件实事。
+#   若只看 steps，会误判"Agent 什么也没干"。tool_calls 才反映**实际工作量**。
+register_histogram("rag_agent_tool_calls", "Agent 单次运行的工具调用次数分布",
+                   (), (0, 1, 2, 3, 4, 6, 8, 12, 20))
 register_counter("rag_llm_tokens_total", "LLM token 消耗（kind=prompt|completion）",
                  ("scene", "kind"))
 register_counter("rag_sql_guard_rejections_total",

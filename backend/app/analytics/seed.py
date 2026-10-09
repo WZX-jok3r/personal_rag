@@ -279,6 +279,53 @@ def load_file(
     return results
 
 
+# ==================== 供 worker 调用的入口（P7 补齐）====================
+
+def should_sync_to_analytics(path: Path) -> bool:
+    """判断该文件是否应同步到 SQL 侧。
+
+    只有表格类文件有意义（xlsx/xlsm）；PDF/DOCX 的表格提取是启发式的、
+    跨页会截断，用它建表会引入静默错误 —— 这是本项目刻意划定的数据源边界
+    （见 docs/text2sql-数据层设计.md §5.0）。
+    """
+    return path.suffix.lower() in {".xlsx", ".xlsm"}
+
+
+def sync_analytics_tables(path: Path) -> List[LoadResult]:
+    """把单个文件的表格同步成 SQL 表（供 ARQ worker 在入库流程中调用）。
+
+    ## 为什么需要这个函数（一段被漏掉的实现）
+
+    设计文档《text2sql-数据层设计.md》明确写了「复用现有异步入库链路，
+    把『表格转表』做成一个 ARQ 任务」，并画出：
+
+        POST /documents 上传 xlsx
+          └─ worker: ingest_document
+              ├─ [现有] 解析 → 分块 → 向量化 → Qdrant
+              └─ [新增] tabular_detect → 类型推断 → CREATE TABLE / COPY
+
+    **但实际只交付了手动 CLI（`python -m app.analytics.seed`），worker 从未接线。**
+    后果：通过 API 上传的 xlsx **不会**出现在 SQL 侧 ——
+    RAG 能检索到、SQL 查不到，两条通道静默不一致。
+    本函数即为补上这一环。
+
+    ## 设计取舍
+
+    - **只处理 xlsx**（`should_sync_to_analytics` 判定），与既有数据源边界一致
+    - **幂等**：`create_or_replace_table` 先 DROP 再建，重灌安全
+    - **不负责建库/建角色**：那是运维动作（`app.analytics.setup_db`），
+      部署时执行一次。此处若库不存在会抛异常，由调用方决定如何处理
+    - 返回每个 sheet 的装载结果，便于 worker 记录与前端展示
+    """
+    analytics_engine = create_engine(settings.sync_analytics_url)
+    rag_engine = create_engine(settings.sync_postgres_url)
+    try:
+        return load_file(analytics_engine, rag_engine, path)
+    finally:
+        analytics_engine.dispose()
+        rag_engine.dispose()
+
+
 # ==================== 真值自检 ====================
 
 # 用 pandas/openpyxl 直读原始文件算出的真值（见改造方案第三部分）。

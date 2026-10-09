@@ -1,17 +1,25 @@
 """指标注册表 + trace_id 的单测。
 
-## 一个必须先说清的语义（我自己一度误判成 bug）
+## 先说清楚一个曾经搞错的语义（L-017 的更正）
 
-Prometheus 直方图的 `le` 是**上界**，`_bucket{le=X}` 的语义是
-「观测值 ≤ X 的**累计**次数」，且 le 序列必须单调不减。
-因此 `observe(3.0)` 会命中**所有** `le >= 3` 的桶 —— 这是正确行为，不是 bug。
+Prometheus 直方图 `_bucket{le=X}` 的语义是「观测值 **≤ X 的**次数」——
+是**真累计**（由导出的各桶前缀和构成），**不是**把每个观测值往所有
+`le >= 它的桶`里都加一遍。
 
-我最初看到 `le=3..6` 的桶值 1,2,3,5 而 `_count=2`，误以为计数错乱，
-实际那正是两次观测（3 和 6）的累计分布函数。
-**这类误判的代价是去"修"一段本来正确的代码**，所以下面用测试把正确语义钉死：
-  - 累计桶必须单调不减
-  - `_count` 等于观测次数
-  - 最后一个 `+Inf` 桶等于 `_count`
+本模块**初版恰好写错了这一点**：`observe()` 就做了累计，
+`render()` 又做了一次前缀和 —— **累计两次**。后果（3 次观测）：
+    _count = 3、+Inf = 3，但最后一个桶 = 20，桶值随观测数二次增长。
+`histogram_quantile()` 依赖"桶是真累计"这个前提，喂给它这种序列
+会算出**无意义的 P95**，而且静默（指标照常有输出）。
+
+当时我还"验证通过"过一次，但那个验证脚本**复刻了 observe 的错误逻辑**
+再与导出结果比较 —— 等于自己和自己比，必然通过。
+**教训：验证脚本必须独立于被验证的实现（用另一条路径算真值）。**
+
+因此下面 TestHistogramSemantics 的核心是
+`test_matches_independently_computed_truth`：
+真值由测试**独立**计算（`sum(1 for v in obs if v <= b)`），
+不复用实现里的任何逻辑。
 """
 
 from __future__ import annotations
@@ -42,62 +50,122 @@ def _buckets_of(rendered: str, name: str, label: str = "") -> list[tuple[str, in
     return out
 
 
+def _bucket_map(rendered: str, name: str) -> dict:
+    """le -> 值（le 统一 float 化，+Inf 单列）。"""
+    actual, inf = {}, None
+    for le, val in _buckets_of(rendered, name):
+        if le == "+Inf":
+            inf = val
+        else:
+            actual[float(le)] = val
+    return {"buckets": actual, "inf": inf}
+
+
 # ==================== 直方图语义 ====================
 
 class TestHistogramSemantics:
-    def test_observations_land_in_cumulative_buckets(self):
-        """观测值落入其所有上界 >= 它的桶（累计语义）。"""
-        M.observe("rag_agent_steps", 3.0)
-        counts = M._histograms["rag_agent_steps"][()]["counts"]
-        # value=3.0 ⇒ 命中 le=3,4,5,6,8,10（1.0/2.0 未命中）
-        assert sorted(counts) == [3.0, 4.0, 5.0, 6.0, 8.0, 10.0], sorted(counts)
+    """直方图导出的正确性 —— 用**独立计算**的真值比对。"""
 
-    def test_buckets_are_monotonic_nondecreasing(self):
-        """le 序列必须单调不减（Prometheus exposition format 硬性要求）。
+    LATENCY = [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]
 
-        若这条失败，Grafana 的 histogram_quantile() 会算出无意义的 P95。
+    @pytest.mark.parametrize("obs", [
+        [0.05, 0.3, 8.0],
+        [0.001, 0.002, 0.003],          # 全落第一个桶
+        [100.0],                        # 超出所有桶（只应体现在 +Inf）
+        [0.5],
+        [0.01, 60.0],                   # 两端边界
+        [],                             # 无观测
+    ], ids=lambda o: f"n{len(o)}")
+    def test_matches_independently_computed_truth(self, obs):
+        """核心测试：真值**独立**计算，不复用实现的任何逻辑。"""
+        for v in obs:
+            M.observe("rag_http_request_duration_seconds", v, ("GET", "/x"))
+        got = _bucket_map(M.render(), "rag_http_request_duration_seconds")
+
+        if not obs:
+            assert got["buckets"] == {} and got["inf"] is None
+            return
+
+        for b in self.LATENCY:
+            truth = sum(1 for v in obs if v <= b)      # 独立真值
+            assert got["buckets"].get(b) == truth, (
+                f"le={b} 应为 {truth}（观测 {obs}），实际 {got['buckets'].get(b)}"
+            )
+
+        # +Inf 必须等于总观测数
+        assert got["inf"] == len(obs)
+
+    def test_does_not_grow_quadratically(self):
+        """回归测试：初版的"累计两次"会让桶值随观测数**二次增长**。
+
+        判据：任何桶值都不能超过总观测数（这是计数器的硬上界）。
         """
+        n = 10
+        for _ in range(n):
+            M.observe("rag_http_request_duration_seconds", 0.05, ("GET", "/x"))
+        got = _bucket_map(M.render(), "rag_http_request_duration_seconds")
+        for b, val in got["buckets"].items():
+            assert val <= n, f"le={b} 的桶值 {val} 超过观测总数 {n} —— 疑似重复累计"
+        assert got["buckets"][0.05] == n
+
+    def test_buckets_monotonic_nondecreasing(self):
+        """le 序列必须单调不减（exposition format 硬性要求）。"""
         for v in (3.0, 6.0, 1.0, 10.0, 2.5):
             M.observe("rag_agent_steps", v)
-        buckets = _buckets_of(M.render(), "rag_agent_steps")
-        values = [n for _, n in buckets if _ != "+Inf"]
-        assert values == sorted(values), f"桶值非单调不减: {buckets}"
+        vals = [n for _, n in _buckets_of(M.render(), "rag_agent_steps")]
+        assert vals == sorted(vals), vals
 
     def test_count_matches_observations(self):
         for v in (3.0, 6.0, 1.0):
             M.observe("rag_agent_steps", v)
-        rendered = M.render()
-        assert "rag_agent_steps_count 3" in rendered
+        assert "rag_agent_steps_count 3" in M.render()
 
     def test_inf_bucket_equals_count(self):
-        """+Inf 桶必须等于总观测数（累计的终点）。"""
         for v in (1.0, 5.0):
             M.observe("rag_agent_steps", v)
-        buckets = dict(_buckets_of(M.render(), "rag_agent_steps"))
-        assert buckets["+Inf"] == 2
-
-    def test_known_cdf(self):
-        """两次观测 (3, 6) 的累计分布：le=1..10 → 0,0,1,2,3,5,7,9。
-
-        这是把"我一度误判成 bug 的正确行为"固化成断言。
-        """
-        M.observe("rag_agent_steps", 3.0)
-        M.observe("rag_agent_steps", 6.0)
-        buckets = _buckets_of(M.render(), "rag_agent_steps")
-        seq = [n for le, n in buckets if le != "+Inf"]
-        assert seq == [0, 0, 1, 2, 3, 5, 7, 9], f"实际 {seq}"
+        assert _bucket_map(M.render(), "rag_agent_steps")["inf"] == 2
 
     def test_sum_accumulates(self):
         M.observe("rag_agent_steps", 3.0)
         M.observe("rag_agent_steps", 6.0)
         assert "rag_agent_steps_sum 9" in M.render()
 
+    def test_observation_lands_in_smallest_fitting_bucket(self):
+        """观测值只落进"能容纳它的最小桶"，而不是所有更大的桶。"""
+        M.observe("rag_agent_steps", 3.0)
+        counts = M._histograms["rag_agent_steps"][()]["counts"]
+        assert counts == {3.0: 1}, f"原始计数应只命中 le=3，实际 {counts}"
+
     def test_uses_registered_buckets_not_default(self):
         """分桶必须取自注册配置，否则步数会按延迟分桶统计（静默失真）。"""
         M.observe("rag_agent_steps", 3.0)
-        buckets = {le for le, _ in _buckets_of(M.render(), "rag_agent_steps")}
-        assert "1" in buckets and "10" in buckets        # 步数分桶
-        assert "0.01" not in buckets                      # 不是延迟分桶
+        le_set = {le for le, _ in _buckets_of(M.render(), "rag_agent_steps")}
+        assert "1" in le_set and "10" in le_set      # 步数分桶
+        assert "0.01" not in le_set                   # 不是延迟分桶
+
+    def test_out_of_range_only_in_inf(self):
+        """超出所有桶的观测只应体现在 +Inf，不应污染任何 le 桶。"""
+        M.observe("rag_agent_steps", 99.0)
+        got = _bucket_map(M.render(), "rag_agent_steps")
+        assert all(v == 0 for v in got["buckets"].values()), got["buckets"]
+        assert got["inf"] == 1
+
+
+class TestAgentToolCallsMetricExists:
+    """存在性测试：防止指标名被静默删掉（实测踩过"注册了但没埋点"的问题）。
+
+    与 `TestNoUninstrumentedMetrics` 的分工：
+      本类只断言 `rag_agent_tool_calls` 这一个**为修复缺口而新增**的指标存在。
+    """
+
+    def test_registered(self):
+        assert "rag_agent_tool_calls" in M._META
+        assert M._META["rag_agent_tool_calls"][2] == "histogram"
+
+    def test_render_includes_help_type(self):
+        rendered = M.render()
+        assert "# HELP rag_agent_tool_calls " in rendered
+        assert "# TYPE rag_agent_tool_calls histogram" in rendered
 
 
 # ==================== 计数器 ====================

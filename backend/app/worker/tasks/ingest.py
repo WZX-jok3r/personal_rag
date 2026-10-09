@@ -13,6 +13,8 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from app.analytics.seed import should_sync_to_analytics
+from app.core.config import settings
 from app.ingestion.indexer import process_file
 from app.models.document import DocumentStatus
 from app.models.ingest_task import TaskStatus
@@ -69,5 +71,40 @@ async def ingest_document(
         await IngestTaskRepository(s).update_status(task_id, TaskStatus.DONE.value, progress=100)
         await s.commit()
 
+    # 4) 表格类文件：同步到 SQL 侧（RAG + Text2SQL 双通道）
+    #
+    # ⚠️ 补上一段曾被漏掉的实现：设计文档《text2sql-数据层设计.md》明确要求
+    #    「复用现有异步入库链路，把『表格转表』做成一个 ARQ 任务」，
+    #    但先前只交付了手动 CLI，worker 未接线 —— 后果是**通过 API 上传的 xlsx
+    #    不会出现在 SQL 侧**：RAG 能检索到、SQL 查不到，两条通道静默不一致。
+    #
+    # 关键设计：本步骤**失败不影响主流程**（不 re-raise）。
+    #   理由：向量化成功即 RAG 侧可用；SQL 侧同步失败只应降级为"该文件暂时查不了"，
+    #   不该让整个入库任务失败并触发 ARQ 重试（重试会重复做一遍向量化，代价高）。
+    #   失败信息写进 record / 日志，便于排查。
+    analytics_sync: Dict[str, Any] = {"attempted": False}
+    if settings.analytics_sync_on_ingest and should_sync_to_analytics(Path(file_path)):
+        analytics_sync["attempted"] = True
+        try:
+            from app.analytics.seed import sync_analytics_tables
+
+            results = await asyncio.to_thread(sync_analytics_tables, Path(file_path))
+            analytics_sync["ok"] = True
+            analytics_sync["tables"] = [
+                {"table": r.table_name, "sheet": r.sheet_name,
+                 "rows": r.row_count, "columns": r.column_count}
+                for r in results
+            ]
+            logger.info("[IngestJob] 任务 %s 已同步 %d 张表到 SQL 侧: %s",
+                        task_id, len(results),
+                        ", ".join(r.table_name for r in results))
+        except Exception as e:  # noqa: BLE001
+            analytics_sync["ok"] = False
+            analytics_sync["error"] = str(e)[:300]
+            logger.warning(
+                "[IngestJob] 任务 %s 的 SQL 侧同步失败（不影响 RAG 入库）: %s",
+                task_id, str(e)[:200],
+            )
+
     logger.info("[IngestJob] 任务 %s 完成: %s -> %s", task_id, Path(file_path).name, status)
-    return record
+    return {**record, "analytics_sync": analytics_sync}

@@ -167,7 +167,7 @@ Google ADK / DB-GPT）后决定手写约 300 行有界状态机。理由：只�
 | **Valid SQL Rate** | 100%（42/42） | 同上 |
 | **平均生成次数** | 1.00（一次生成即正确） | 同上 |
 | **检索 Recall@5 / MRR** | 99.01% / 0.9703（107 题） | `python -m eval --retrieval-only` |
-| **单测** | **508 passed** | `pytest -q` |
+| **单测** | **541 passed** | `pytest -q` |
 | **SQL 攻击载荷拦截** | 44/44 | `pytest tests/test_sql_guard.py` |
 | **端到端延迟** | SQL 查询 2~5ms；检索路径首帧 <1s | `scripts/check.ps1 -Full` |
 
@@ -272,11 +272,11 @@ backend/
 │   ├── rag/ vector/ ingestion/ llm/ worker/     # 原有 RAG 链路（基本未改）
 │   └── core/             # config / security(RBAC) / retry / exceptions
 ├── eval/                 # 两个评测 runner + 冻结基线
-├── tests/                # 508 项测试
+├── tests/                # 541 项测试
 └── migrations/           # Alembic（元数据表 / 审计 / 用量）
 frontend/src/             # Vue3 SPA（AgentTrace / MessageBubble / ChatView）
 scripts/check.ps1         # 三级验证闸口
-docs/                     # 改造方案 + 数据层设计 + 经验教训（16 条）
+docs/                     # 改造方案 + 数据层设计 + 经验教训（19 条）
 ```
 
 ---
@@ -301,7 +301,7 @@ docs/                     # 改造方案 + 数据层设计 + 经验教训（16 �
 
 ## 九、工程实践与踩坑记录
 
-本项目把**真实踩过的坑**沉淀成了 [docs/经验教训.md](docs/经验教训.md)（16 条），
+本项目把**真实踩过的坑**沉淀成了 [docs/经验教训.md](docs/经验教训.md)（19 条），
 每条都是"现象 → 根因 → 处置 → 可执行的规避规则"。几条最有代表性的：
 
 | # | 坑 | 教训 |
@@ -336,6 +336,6 @@ docs/                     # 改造方案 + 数据层设计 + 经验教训（16 �
 |---|---|
 | [docs/升级为内部知识库Agent-完整改造方案.md](docs/升级为内部知识库Agent-完整改造方案.md) | 完整改造方案：结构梳理、优缺点诊断、可行性调研、8 阶段计划、简历包装 |
 | [docs/text2sql-数据层设计.md](docs/text2sql-数据层设计.md) | 可直接执行的 DDL、只读角色、RLS、ETL 与数据源边界 |
-| [docs/经验教训.md](docs/经验教训.md) | 16 条真实踩坑记录与方法学规则 |
+| [docs/经验教训.md](docs/经验教训.md) | 19 条真实踩坑记录与方法学规则 |
 | [docs/项目全景深度解析.md](docs/项目全景深度解析.md) | 原有 RAG 模块逐一梳理与端到端调用链 |
 | [docs/RAG面试题库_初中高60题.md](docs/RAG面试题库_初中高60题.md) | RAG 面试题库 |

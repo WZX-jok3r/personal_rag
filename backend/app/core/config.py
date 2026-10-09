@@ -45,8 +45,14 @@ class Settings(BaseSettings):
     environment: str = "development"          # development / staging / production
     debug: bool = False
     log_level: str = "INFO"
+    # 日志格式：text（默认，人读友好）| json（结构化单行，便于日志采集器解析）
+    log_format: str = "text"
     host: str = "0.0.0.0"
     port: int = 8000
+
+    # ==================== 可观测（P7）====================
+    # Prometheus 指标端点开关（GET /metrics，Prometheus 文本格式）
+    metrics_enabled: bool = True
 
     # ==================== Qdrant 向量库 ====================
     qdrant_host: str = "localhost"

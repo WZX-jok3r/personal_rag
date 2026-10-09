@@ -416,7 +416,25 @@ class AgentLoop:
             "degraded_reason": state.degraded_reason,
             "elapsed_ms": int((time.monotonic() - t_start) * 1000),
         }
+        self._record_metrics(state)
         yield ev.ev_done(answer, agent_stats=self.last_stats)
+
+    def _record_metrics(self, state: AgentState) -> None:
+        """把本次运行写入 Prometheus 指标。
+
+        记录 route 与 degraded：前者用于看"各通道占比"（规则路由是否在起作用），
+        后者是**可用性告警的核心指标** —— 降级率突然升高说明下游出了问题。
+        指标写入失败不影响主流程。
+        """
+        try:
+            from app.core.metrics import counter_inc, observe
+
+            route = state.route.route.value if state.route else "unknown"
+            counter_inc("rag_agent_runs_total",
+                        (route, "true" if state.degraded else "false"))
+            observe("rag_agent_steps", float(state.steps))
+        except Exception:  # noqa: BLE001
+            pass
 
     def _compose_answer(self, state: AgentState) -> str:
         """用模型把工具观察组织成自然语言答案。"""

@@ -36,7 +36,7 @@ from sqlalchemy.orm import Session
 from app.analytics import fewshot as fs
 from app.analytics import schema as schema_mod
 from app.analytics.executor import QueryResult, SqlExecutor, get_executor
-from app.analytics.guard import guard_sql
+from app.analytics.guard import guard_and_record
 from app.core.config import settings
 from app.llm.tools import ToolCall, get_tool_llm_client
 
@@ -330,7 +330,7 @@ class Text2SqlEngine:
             raw_sql = sql_call.parse_args().get("sql", "")
 
             # ---- 5. guard 校验 ----
-            g = guard_sql(raw_sql, settings.sql_max_rows)
+            g = guard_and_record(raw_sql, settings.sql_max_rows)
             if not g.ok:
                 last_error = g.user_message or g.reason
                 result.errors.append(f"guard 拒绝: {g.reason}")

@@ -284,3 +284,41 @@ def guard_sql(raw_sql: str, max_rows: int) -> GuardResult:
 def is_safe(sql: str, max_rows: int = 200) -> bool:
     """便捷判断（供测试与快速自检使用）。"""
     return guard_sql(sql, max_rows).ok
+
+
+def _rejection_category(reason: str) -> str:
+    """把拒绝原因归一到有限类别，避免原因文本产生高基数指标标签。"""
+    for marker, label in (
+        ("多语句", "multi_statement"),
+        ("禁止语句", "forbidden_statement"),
+        ("系统表", "system_table"),
+        ("禁止函数", "forbidden_function"),
+        ("结构不完整", "incomplete_select"),
+        ("解析", "parse_error"),
+        ("空", "empty"),
+    ):
+        if marker in reason:
+            return label
+    return "other"
+
+
+def guard_and_record(raw_sql: str, max_rows: int) -> GuardResult:
+    """带指标记录的 guard —— **生产调用点应该用这个**。
+
+    为什么把指标放在包装函数里而不是塞进 `guard_sql`：
+        `guard_sql` 是**纯函数**（有 90+ 条单测依赖它无副作用、可穷举），
+        往里加全局指标副作用会污染它的语义。
+        包装函数只做"调用 + 记账"，职责单一。
+
+    记 `rag_sql_guard_rejections_total` 的价值：
+        单测只能证明"能挡住"，**这个指标才能回答"线上真的在挡、挡了多少、挡的是什么"**。
+    """
+    result = guard_sql(raw_sql, max_rows)
+    if not result.ok:
+        try:
+            from app.core.metrics import counter_inc
+
+            counter_inc("rag_sql_guard_rejections_total", (_rejection_category(result.reason),))
+        except Exception:  # noqa: BLE001
+            pass
+    return result

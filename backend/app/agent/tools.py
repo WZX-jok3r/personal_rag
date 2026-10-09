@@ -203,6 +203,14 @@ class AgentTools:
             lines.append(f"[{i}] （来源：{src}）\n{c.get('text', '')}")
         observation = "\n\n".join(lines)
 
+        # 召回条数分布：用于观察检索质量是否随时间漂移
+        try:
+            from app.core.metrics import observe
+
+            observe("rag_retrieval_chunks", float(len(chunks)))
+        except Exception:  # noqa: BLE001
+            pass
+
         return ToolOutcome(
             ok=True, name="kb_search",
             observation=observation,
@@ -232,9 +240,9 @@ class AgentTools:
             actor: 审计标识（形如 "tenant:role"）
         """
         from app.analytics.executor import get_executor
-        from app.analytics.guard import guard_sql
+        from app.analytics.guard import guard_and_record
 
-        g = guard_sql(sql, settings.sql_max_rows)
+        g = guard_and_record(sql, settings.sql_max_rows)
         if not g.ok:
             return ToolOutcome(
                 ok=False, name="sql_query",

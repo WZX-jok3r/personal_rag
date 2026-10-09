@@ -214,6 +214,7 @@ class SqlExecutor:
             elapsed = int((time.perf_counter() - start) * 1000)
             msg = str(e)
             logger.warning("[executor] SQL 执行失败(%dms): %s", elapsed, msg[:300])
+            self._record_metrics(ok=False, elapsed_ms=elapsed, masked=[])
             self._audit(sql, actor, tenant_id, ok=False, row_count=0,
                         elapsed_ms=elapsed, error=msg, redacted=[])
             return QueryResult(
@@ -243,9 +244,27 @@ class SqlExecutor:
         )
         res.observation = self.build_observation(res)
 
+        self._record_metrics(ok=True, elapsed_ms=elapsed, masked=masked_columns)
         self._audit(sql, actor, tenant_id, ok=True, row_count=res.row_count,
                     elapsed_ms=elapsed, error="", redacted=masked_columns)
         return res
+
+    @staticmethod
+    def _record_metrics(ok: bool, elapsed_ms: int, masked: List[str]) -> None:
+        """写 Prometheus 指标（失败不影响主流程）。
+
+        `rag_sql_redactions_total` 按**列**计数 —— 它能回答
+        "有没有人在反复试探薪资/邮箱"，是安全运营的观测点。
+        """
+        try:
+            from app.core.metrics import counter_inc, observe
+
+            counter_inc("rag_sql_queries_total", ("true" if ok else "false",))
+            observe("rag_sql_duration_seconds", elapsed_ms / 1000.0)
+            for col in masked or []:
+                counter_inc("rag_sql_redactions_total", (col,))
+        except Exception:  # noqa: BLE001
+            pass
 
     # ---- 审计 ----
     def _audit(self, sql: str, actor: str, tenant_id: Optional[str], *,

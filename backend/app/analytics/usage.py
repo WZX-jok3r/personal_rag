@@ -38,6 +38,20 @@ def record_usage(
     """写一条用量记录。usage 为 OpenAI 兼容的 usage 字典（可为空）。"""
     if not usage:
         return
+
+    # Prometheus 指标（与落库并行）：即使落库失败，指标仍能反映消耗趋势
+    try:
+        from app.core.metrics import counter_inc
+
+        pt = int(usage.get("prompt_tokens") or 0)
+        ct = int(usage.get("completion_tokens") or 0)
+        if pt:
+            counter_inc("rag_llm_tokens_total", (scene, "prompt"), pt)
+        if ct:
+            counter_inc("rag_llm_tokens_total", (scene, "completion"), ct)
+    except Exception:  # noqa: BLE001
+        pass
+
     try:
         from app.models.llm_usage import LlmUsage
 

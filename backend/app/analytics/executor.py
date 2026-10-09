@@ -47,6 +47,48 @@ logger = logging.getLogger(__name__)
 # 拿不到任何租户私有数据。
 ANONYMOUS_TENANT = "@anonymous@"
 
+# 不允许被当作"租户身份"使用的保留值。
+#
+# ## 为什么需要这个守卫（两次踩坑的产物）
+#
+# RLS 的判据是 `tenant_id = current_setting('app.tenant_id')`，
+# 因此**任何能出现在 tenant_id 列里的值，都同时是一把潜在的钥匙**。
+# 这一条我踩了两次：
+#
+#   1. 列默认值原为 `''` ⇒ 只要某条路径用空串当身份，
+#      `'' = ''` 就成立 ⇒ **全部未归属行立刻可见**（实测过）。
+#   2. 改成 `'@unowned@'` 后，用 `'@unowned@'` 当身份又能匹配
+#      ⇒ **把哨兵值当身份用，就打开了所有未归属行**（实测过）。
+#
+# 结论：光挑一个"看起来特殊"的字符串是没用的，
+# 必须**在入口处显式禁止**这些保留值被当作身份传入。
+# 这样无论列默认值是什么，未归属数据都不会因为"传了某个魔数"而泄露。
+RESERVED_TENANT_IDENTITIES = frozenset({"", ANONYMOUS_TENANT, "@unowned@"})
+
+
+def resolve_tenant_identity(tenant_id: Optional[str]) -> str:
+    """把"请求的租户"规范化成可用于 RLS 的身份，并挡住保留值。
+
+    - `None` / 空串 / 任何保留值 -> 一律落到 `ANONYMOUS_TENANT`
+      （只可能匹配到 `is_shared` 的行，读不到任何私有/未归属数据）
+    - 正常租户名 -> 原样返回
+
+    这是**唯一的租户身份入口**：`_apply_session_guards` 必须经它取值，
+    避免各调用点各自判断（那正是"两通道不对称"的成因）。
+    """
+    if tenant_id is None:
+        return ANONYMOUS_TENANT
+    value = str(tenant_id).strip()
+    if value in RESERVED_TENANT_IDENTITIES:
+        if value:
+            logger.warning(
+                "[executor] 租户身份 %r 是保留值，已按匿名处理"
+                "（只可见共享语料）—— 请检查上游是否误传了哨兵值",
+                value,
+            )
+        return ANONYMOUS_TENANT
+    return value
+
 
 @dataclass
 class QueryResult:
@@ -157,13 +199,12 @@ class SqlExecutor:
         #    现在两道一起改：
         #      - 策略改为 fail-closed（见 ddl.build_rls_sql）：只有
         #        is_shared 或 tenant_id 匹配才放行；
-        #      - 这里**永远**设置变量，未认证时用一个不可能匹配到任何租户的哨兵值，
+        #      - 这里**永远**设置变量，且身份经 resolve_tenant_identity()
+        #        规范化 —— 保留值（空串/@unowned@/哨兵）一律按匿名处理，
         #        从而只能读到 is_shared 的共享语料。
-        #    这样"忘设变量"不再是漏洞（fail-closed 兜底），
-        #    而"没租户"也语义明确：只能看共享语料。
         conn.execute(
             text("SELECT set_config('app.tenant_id', :v, true)"),
-            {"v": tenant_id if tenant_id else ANONYMOUS_TENANT},
+            {"v": resolve_tenant_identity(tenant_id)},
         )
 
     # ---- 预检 ----

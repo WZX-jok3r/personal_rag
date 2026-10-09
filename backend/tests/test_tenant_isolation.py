@@ -41,6 +41,10 @@ from app.core.config import settings
 
 TENANT_A = "test-tenant-a"
 TENANT_B = "test-tenant-b"
+# 一个"确定不存在"的任意租户名，用于验证共享语料对陌生租户也可见。
+# （原写法是 `ANON if (ANON := "x") else "x"` —— 海象表达式套在三元里，
+#   条件恒为真，等价于直接写 "x"，属重构残留的无意义写法。）
+ARBITRARY_TENANT = "test-tenant-unrelated"
 TABLE = "rls_probe_tbl"
 
 
@@ -236,7 +240,7 @@ class TestSharedCorpusStillVisible:
 
     def test_shared_rows_visible_to_any_tenant(self, admin_engine, ro_engine):
         _make_table(admin_engine, tenant_id="", is_shared=True)
-        for t in (TENANT_A, TENANT_B, ANON if (ANON := "x") else "x"):
+        for t in (TENANT_A, TENANT_B, ARBITRARY_TENANT):
             assert _count(ro_engine, t) == 2, f"共享语料对 {t} 不可见"
 
     def test_shared_rows_visible_without_variable(self, admin_engine, ro_engine):
@@ -263,13 +267,33 @@ class TestSharedCorpusStillVisible:
             e.dispose()
 
 
-# ==================== 既有表兼容 ====================
+# ==================== 既有表升级（曾经的 fail-open 迁移）====================
 
-class TestLegacyTableCompatibility:
-    """升级前建的表（无 is_shared 列）不能因为策略收紧而整表不可读。"""
+class TestLegacyTableMigration:
+    """升级旧结构表时：既要补列、装策略，**又不能**自动放开权限。
 
-    def test_ensure_tenant_columns_backfills(self, admin_engine, ro_engine):
-        # 造一张"旧结构"表：只有 tenant_id，没有 is_shared
+    ## 这个类替换掉了原先一个"通过理由不成立"的测试
+
+    原测试是：
+        ddl.ensure_tenant_columns(admin, TABLE)
+        assert _count(ro_engine, TENANT_A) == 1     # "补列后仍可见"
+    它断言旧表补列后**仍对所有租户可见**，理由是"不能因升级而消失"。
+
+    实测发现它**通过的理由和它声称的理由完全无关**：
+      - 该表补列后 `RLS 启用=False，策略=[]` —— **根本没有租户保护**，
+        所以当然"可见"；
+      - 而初版 `ensure_tenant_columns` 还会**自动把所有行标记为共享**，
+        这是典型的 fail-open 权限放开（共享 = 最宽松级别）。
+
+    也就是说：那个"可见"既来自 fail-open 迁移，又来自压根没装策略。
+    两个问题叠在一起，测试却是绿的。
+
+    现在语义改为 fail-closed + 显式 opt-in，下面按**三种情形**分别断言。
+    """
+
+    @staticmethod
+    def _make_legacy_table(admin_engine, tenant_id: str = "") -> None:
+        """造一张"旧结构"表：有 tenant_id、**没有** is_shared、**没有** RLS。"""
         with admin_engine.begin() as c:
             c.execute(text(f"DROP TABLE IF EXISTS {ddl.q(TABLE)} CASCADE"))
             c.execute(text(
@@ -278,15 +302,164 @@ class TestLegacyTableCompatibility:
                 f"  {ddl.q(ddl.TENANT_COLUMN)} VARCHAR(64) NOT NULL DEFAULT '', "
                 f"  id SERIAL PRIMARY KEY)"
             ))
-            c.execute(text(f"INSERT INTO {ddl.q(TABLE)} ({ddl.q('col_1')}) VALUES ('old')"))
+            c.execute(text(
+                f"INSERT INTO {ddl.q(TABLE)} ({ddl.q('col_1')}, "
+                f"{ddl.q(ddl.TENANT_COLUMN)}) VALUES ('old', :t)"), {"t": tenant_id})
 
-        ddl.ensure_tenant_columns(admin_engine, TABLE)
+    def test_backfills_columns_and_applies_rls(self, admin_engine, ro_engine):
+        """补列**并且**装策略 —— 只补列不装策略等于升级了个假的安全。"""
+        self._make_legacy_table(admin_engine)
+        res = ddl.ensure_tenant_columns(admin_engine, TABLE)
 
         with admin_engine.connect() as c:
             cols = {r[0] for r in c.execute(text(
                 "SELECT column_name FROM information_schema.columns "
                 "WHERE table_name = :t"), {"t": TABLE})}
-        assert ddl.SHARED_COLUMN in cols, "应补齐 is_shared 列"
+            rls = c.execute(text(
+                "SELECT relrowsecurity FROM pg_class WHERE relname = :t"),
+                {"t": TABLE}).scalar_one()
+            policies = c.execute(text(
+                "SELECT count(*) FROM pg_policy WHERE polrelid = "
+                "cast(:r as regclass)"), {"r": TABLE}).scalar_one()
 
-        # 旧表按共享处理：补列后仍对所有租户可见（不因升级而"消失"）
+        assert ddl.SHARED_COLUMN in cols, "应补齐 is_shared 列"
+        assert res["rls_applied"] is True
+        assert rls is True, "补列后必须启用 RLS，否则表完全不受保护"
+        assert policies >= 1, "补列后必须存在租户隔离策略"
+
+    def test_does_not_auto_mark_shared(self, admin_engine, ro_engine):
+        """**fail-closed**：默认绝不自动把存量行标成共享。"""
+        self._make_legacy_table(admin_engine)
+        res = ddl.ensure_tenant_columns(admin_engine, TABLE)
+
+        assert res["marked_shared"] == 0, (
+            "自动把存量行标记为共享 = 自动选择最宽松的可见级别，是 fail-open"
+        )
+        with admin_engine.connect() as c:
+            n = c.execute(text(
+                f"SELECT count(*) FROM {ddl.q(TABLE)} "
+                f"WHERE {ddl.q(ddl.SHARED_COLUMN)} IS TRUE")).scalar_one()
+        assert n == 0, "不应有任何行被自动标记为共享"
+
+    def test_unowned_rows_become_invisible(self, admin_engine, ro_engine):
+        """既非共享、又无归属的行，升级后**不可见**（默认拒绝）。"""
+        self._make_legacy_table(admin_engine, tenant_id="")
+        res = ddl.ensure_tenant_columns(admin_engine, TABLE)
+
+        assert res["private_rows"] == 1, "应报告有 1 行变成不可见（让这件事被看见）"
+        assert _count(ro_engine, TENANT_A) == 0, "无归属行不应被任意租户读到"
+
+    def test_owned_rows_follow_their_tenant(self, admin_engine, ro_engine):
+        """带真实归属的行，升级后仍只对**那个租户**可见。"""
+        self._make_legacy_table(admin_engine, tenant_id=TENANT_B)
+        ddl.ensure_tenant_columns(admin_engine, TABLE)
+
+        assert _count(ro_engine, TENANT_B) == 1, "归属租户应仍能读到自己的行"
+        assert _count(ro_engine, TENANT_A) == 0, "别的租户不应读到"
+
+    def test_explicit_mark_shared_is_opt_in(self, admin_engine, ro_engine):
+        """显式 opt-in 才能放开 —— 且放开后确实对所有租户可见。"""
+        self._make_legacy_table(admin_engine, tenant_id="")
+        res = ddl.ensure_tenant_columns(admin_engine, TABLE, mark_shared=True)
+
+        assert res["marked_shared"] == 1
         assert _count(ro_engine, TENANT_A) == 1
+        assert _count(ro_engine, ARBITRARY_TENANT) == 1
+
+    def test_mark_table_shared_standalone(self, admin_engine, ro_engine):
+        """放开权限做成**独立、有名字、需被调用**的动作，而不是迁移副作用。"""
+        self._make_legacy_table(admin_engine, tenant_id="")
+        ddl.ensure_tenant_columns(admin_engine, TABLE)
+        assert _count(ro_engine, TENANT_A) == 0      # 先确认是锁着的
+
+        n = ddl.mark_table_shared(admin_engine, TABLE)
+        assert n == 1
+        assert _count(ro_engine, TENANT_A) == 1
+
+
+class TestTenantSentinelsAreUnmatchable:
+    """保留值必须**谁也匹配不到** —— 否则会变成一把万能钥匙。
+
+    这里踩过两次同样的坑（见 `executor.RESERVED_TENANT_IDENTITIES` 注释）：
+      1. 列默认值 `''` ⇒ 用空串当身份就 `'' = ''`，全部未归属行可见
+      2. 改成 `'@unowned@'` ⇒ 用 `'@unowned@'` 当身份又能匹配
+    所以现在不只"挑个特殊字符串"，而是**在入口显式禁止**保留值当身份。
+    """
+
+    def test_unowned_default_is_not_empty(self):
+        assert ddl.UNOWNED_TENANT != "", "未归属哨兵不能是空串"
+
+    def test_anonymous_sentinel_differs_from_unowned(self):
+        """执行器的匿名哨兵与列默认值必须是两个不同的值。"""
+        from app.analytics.executor import ANONYMOUS_TENANT
+
+        assert ANONYMOUS_TENANT != ddl.UNOWNED_TENANT
+        assert ANONYMOUS_TENANT != ""
+
+    @pytest.mark.parametrize("raw", ["", "@unowned@", "@anonymous@", None, "   "])
+    def test_reserved_identities_become_anonymous(self, raw):
+        """保留值 / 空值一律规范化成匿名身份 —— 不会变成"读未归属行"的钥匙。"""
+        from app.analytics.executor import ANONYMOUS_TENANT, resolve_tenant_identity
+
+        assert resolve_tenant_identity(raw) == ANONYMOUS_TENANT
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("tenant-b", "tenant-b"),
+        ("  tenant-b  ", "tenant-b"),
+        ("a", "a"),
+    ])
+    def test_real_tenants_pass_through(self, raw, expected):
+        from app.analytics.executor import resolve_tenant_identity
+
+        assert resolve_tenant_identity(raw) == expected
+
+    def test_unowned_rows_invisible_to_every_identity(self, admin_engine, ro_engine):
+        """对未归属行：任何身份（含空串与两个哨兵）都读不到。"""
+        from app.analytics.executor import ANONYMOUS_TENANT
+
+        with admin_engine.begin() as c:
+            c.execute(text(f"DROP TABLE IF EXISTS {ddl.q(TABLE)} CASCADE"))
+            c.execute(text(
+                f"CREATE TABLE {ddl.q(TABLE)} ("
+                f"  {ddl.q('col_1')} TEXT, "
+                f"  {ddl.q(ddl.TENANT_COLUMN)} VARCHAR(64) NOT NULL "
+                f"    DEFAULT '{ddl.UNOWNED_TENANT}', "
+                f"  {ddl.q(ddl.SHARED_COLUMN)} BOOLEAN NOT NULL DEFAULT FALSE, "
+                f"  id SERIAL PRIMARY KEY)"))
+            for stmt in ddl.build_rls_sql(TABLE):
+                c.execute(text(stmt))
+            # 显式插入"未归属"行（走列默认值）
+            c.execute(text(f"INSERT INTO {ddl.q(TABLE)} ({ddl.q('col_1')}) VALUES ('x')"))
+
+        for identity in ("", ANONYMOUS_TENANT, TENANT_A, TENANT_B):
+            assert _count(ro_engine, identity) == 0, (
+                f"未归属行被身份 {identity!r} 读到了"
+            )
+        assert _count(ro_engine, None) == 0, "未设变量时也不应读到未归属行"
+
+    def test_application_path_blocks_the_unowned_sentinel(self, admin_engine, ro_engine):
+        """经**应用入口**（resolve_tenant_identity）传 @unowned@ 时也读不到。
+
+        裸 SQL 视角下 `@unowned@ = @unowned@` 确实成立（列默认值就是它），
+        所以真正的防线是**入口守卫**：把保留值规范化成匿名。
+        这条测试锁的就是这道防线。
+        """
+        from app.analytics.executor import resolve_tenant_identity
+
+        with admin_engine.begin() as c:
+            c.execute(text(f"DROP TABLE IF EXISTS {ddl.q(TABLE)} CASCADE"))
+            c.execute(text(
+                f"CREATE TABLE {ddl.q(TABLE)} ("
+                f"  {ddl.q('col_1')} TEXT, "
+                f"  {ddl.q(ddl.TENANT_COLUMN)} VARCHAR(64) NOT NULL "
+                f"    DEFAULT '{ddl.UNOWNED_TENANT}', "
+                f"  {ddl.q(ddl.SHARED_COLUMN)} BOOLEAN NOT NULL DEFAULT FALSE, "
+                f"  id SERIAL PRIMARY KEY)"))
+            for stmt in ddl.build_rls_sql(TABLE):
+                c.execute(text(stmt))
+            c.execute(text(f"INSERT INTO {ddl.q(TABLE)} ({ddl.q('col_1')}) VALUES ('x')"))
+
+        # 模拟应用路径：身份先过守卫，再进 RLS
+        effective = resolve_tenant_identity(ddl.UNOWNED_TENANT)
+        assert effective != ddl.UNOWNED_TENANT, "守卫没有拦住保留值"
+        assert _count(ro_engine, effective) == 0, "经守卫后仍读到了未归属行"

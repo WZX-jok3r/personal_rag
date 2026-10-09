@@ -55,6 +55,20 @@ TENANT_GUC = "app.tenant_id"
 # 并让策略**默认拒绝**：只有 is_shared 或 tenant_id 匹配才放行。
 SHARED_COLUMN = "is_shared"
 
+# 未归属数据的 tenant_id 默认值。
+#
+# ⚠️ 刻意**不用空串 ''**：
+#   执行器在"无租户"时会把 app.tenant_id 设成哨兵值 `@anonymous@`
+#   （见 executor.ANONYMOUS_TENANT，刻意非空以免与"未设置"混淆）。
+#   但如果列默认值是 ''，那么只要有人把哨兵改成 ''（或某条路径用了空串），
+#   策略里 `tenant_id = current_setting(...)` 就会变成 `'' = ''` ⇒ **匹配**，
+#   于是**全部未归属行立刻对那个身份可见** —— 一次静默的权限放开。
+#
+#   用一个不可能与真实租户名或任何哨兵相同的常量做默认值，
+#   让"未归属"在**数据库层面**就无法被匹配到。
+#   这样即使应用层传错值，也不会意外读到未归属数据。
+UNOWNED_TENANT = "@unowned@"
+
 
 def q(identifier: str) -> str:
     """把标识符转义为 PostgreSQL 双引号形式（防注入）。"""
@@ -78,9 +92,11 @@ def build_create_table_sql(schema: InferredSchema, tenant_column: bool = True) -
         lines.append(" ".join(parts))
 
     if tenant_column:
-        # tenant_id 用 '' 而非固定值兜底：空归属比"错误地归属到某个租户"更安全，
-        # 因为 fail-closed 策略下 '' 谁都匹配不到（除非 is_shared）。
-        lines.append(f"  {q(TENANT_COLUMN)} VARCHAR(64) NOT NULL DEFAULT ''")
+        # tenant_id 的默认值用 UNOWNED_TENANT（不可匹配的哨兵）而不是空串：
+        # 空串会与应用层可能传入的空串身份碰撞，导致未归属行意外可见。
+        lines.append(
+            f"  {q(TENANT_COLUMN)} VARCHAR(64) NOT NULL DEFAULT '{UNOWNED_TENANT}'"
+        )
         lines.append(f"  {q(SHARED_COLUMN)} BOOLEAN NOT NULL DEFAULT FALSE")
 
     if pk_cols:
@@ -157,34 +173,128 @@ def build_rls_sql(table_name: str) -> List[str]:
     ]
 
 
-def ensure_tenant_columns(engine: Engine, table_name: str) -> None:
-    """为**已存在**的表补齐 tenant_id / is_shared 两列（幂等）。
+def ensure_tenant_columns(
+    engine: Engine, table_name: str, mark_shared: bool = False,
+    apply_rls: bool = True,
+) -> dict:
+    """为**已存在**的表补齐租户列并启用 fail-closed RLS（幂等）。
 
-    为什么需要它：
-        `create_or_replace_table` 会 DROP 重建，因此新表天然带两列；
-        但**升级前就已存在**的表（例如之前在旧策略下建的 demo 语料表）
-        没有 `is_shared` 列 —— 此时新的 RLS 策略引用它会直接报
-        `column "is_shared" does not exist`，导致整表不可读。
+    ## 为什么需要补列
 
-    语义处理：补列时把 is_shared 设为 **true**（这些表是升级前建的共享语料），
-    并保留各自原有的 tenant_id 值。这样升级后它们仍对所有租户可见，
-    不会因为策略收紧而"突然消失"。
+    `create_or_replace_table` 会 DROP 重建，因此新表天然带两列；
+    但**升级前就已存在**的表没有 `is_shared` 列 —— 此时新的 RLS 策略引用它会
+    直接报 `column "is_shared" does not exist`，导致整表不可读。
+
+    ## ⚠️ 这里曾经是一次 fail-open 迁移（已修正）
+
+    初版在补列之后**自动把存量行全部标记为 `is_shared = TRUE`**，
+    理由是"它们是升级前的共享语料"。这个判断有一个致命问题：
+
+        **共享 = 最宽松的可见级别。自动选择最宽松的级别，
+        正是 fail-open 的定义。**
+
+    如果某张表其实是租户私有数据（例如升级前用 API 上传、带着真实 tenant_id 的表），
+    这次迁移会把它的所有行**对所有租户开放** —— 一次静默的权限放开，
+    而且看起来像"兼容性处理"，不会有人怀疑。
+
+    初版还用一个"该表是否已有共享行"的启发式来决定要不要标记，
+    但**没有任何启发式能证明"存量数据本来就该共享"**。
+
+    ## ⚠️ 第二个缺陷：只补列不装策略，等于"升级"了个假的安全
+
+    初版只执行 `ALTER TABLE ... ADD COLUMN`，**没有调用 `build_rls_sql`**。
+    实测一张"旧结构"表补列后：`RLS 启用=False，策略=[]` ——
+    也就是**完全没有租户保护**，任何租户都能读全部行。
+
+    这解释了一个诡异的测试现象：改完 fail-closed 之后，
+    原测试 `assert _count(ro_engine, TENANT_A) == 1`（断言"补列后仍可见"）
+    **依然通过**。它通过不是因为 fail-closed 失效，
+    而是因为**那张表根本没有策略**，所以当然可见 ——
+    **测试通过的理由和它声称的理由完全无关。**
+
+    现在默认 `apply_rls=True`，补列的同时装上 fail-closed 策略。
+
+    ## 语义：fail-closed + 显式 opt-in
+
+    - 补列时 `is_shared` 默认 **FALSE**，**绝不自动标记任何行**
+    - 需要共享的表由调用方**显式**声明（`mark_shared=True`，
+      或在重灌时用 `load_file(..., is_shared=True)`）
+    - 迁移后若有行"因 fail-closed 而变得不可见"，函数会**返回计数并告警**，
+      让这件事被看见，而不是静默发生
+
+    Args:
+        mark_shared: 仅当调用方**明确知道**该表是共享语料时才传 True。
+            默认 False —— 拿不准时保持不可见（fail-closed）。
+        apply_rls: 是否同时装上 RLS 策略。默认 True（安全默认）。
+            仅在做纯结构迁移（如逐表分批上线策略）时才传 False。
+
+    Returns:
+        {"added_columns": [...], "private_rows": n, "marked_shared": n,
+         "rls_applied": bool}
     """
     stmts = [
         f"ALTER TABLE {q(table_name)} "
-        f"ADD COLUMN IF NOT EXISTS {q(TENANT_COLUMN)} VARCHAR(64) NOT NULL DEFAULT ''",
+        f"ADD COLUMN IF NOT EXISTS {q(TENANT_COLUMN)} "
+        f"VARCHAR(64) NOT NULL DEFAULT '{UNOWNED_TENANT}'",
         f"ALTER TABLE {q(table_name)} "
         f"ADD COLUMN IF NOT EXISTS {q(SHARED_COLUMN)} BOOLEAN NOT NULL DEFAULT FALSE",
     ]
+    result = {"added_columns": [TENANT_COLUMN, SHARED_COLUMN],
+              "private_rows": 0, "marked_shared": 0, "rls_applied": False}
+
     with engine.begin() as conn:
         for stmt in stmts:
             conn.execute(text(stmt))
-        # 仅在"该表还没有任何共享行"时，把存量行标记为共享（一次性升级语义）
-        conn.execute(text(
+
+        if apply_rls:
+            # 补列之后必须装策略 —— 否则"升级"出来的仍是一张裸表
+            for stmt in build_rls_sql(table_name):
+                conn.execute(text(stmt))
+            result["rls_applied"] = True
+
+        if mark_shared:
+            marked = conn.execute(text(
+                f"UPDATE {q(table_name)} SET {q(SHARED_COLUMN)} = TRUE "
+                f"WHERE {q(SHARED_COLUMN)} IS NOT TRUE"
+            )).rowcount
+            result["marked_shared"] = int(marked or 0)
+            logger.warning(
+                "[ddl] 表 %s 的 %d 行被**显式**标记为共享（对所有租户可见）—— "
+                "请确认该表确实是共享语料", table_name, result["marked_shared"],
+            )
+        else:
+            # fail-closed：统计有多少行会因既不共享、又无归属而不可见
+            n = conn.execute(text(
+                f"SELECT count(*) FROM {q(table_name)} "
+                f"WHERE {q(SHARED_COLUMN)} IS NOT TRUE "
+                f"  AND ({q(TENANT_COLUMN)} IS NULL OR {q(TENANT_COLUMN)} = '')"
+            )).scalar_one()
+            result["private_rows"] = int(n or 0)
+            if result["private_rows"]:
+                logger.warning(
+                    "[ddl] 表 %s 补列后有 %d 行既非共享、又无归属租户 —— "
+                    "在 fail-closed 策略下它们对所有人不可见。"
+                    "若这些是共享语料，请显式调用 mark_table_shared() 或 "
+                    "用 load_file(..., is_shared=True) 重灌",
+                    table_name, result["private_rows"],
+                )
+    return result
+
+
+def mark_table_shared(engine: Engine, table_name: str) -> int:
+    """**显式**把一张表的全部行标记为共享语料（对所有租户可见）。返回影响行数。
+
+    刻意做成独立函数、且不放进任何自动流程：把权限放开变回
+    **一个有名字、需要被调用的动作**，而不是迁移的副作用。
+    """
+    with engine.begin() as conn:
+        n = conn.execute(text(
             f"UPDATE {q(table_name)} SET {q(SHARED_COLUMN)} = TRUE "
-            f"WHERE {q(SHARED_COLUMN)} IS NOT TRUE AND NOT EXISTS ("
-            f"  SELECT 1 FROM {q(table_name)} WHERE {q(SHARED_COLUMN)} IS TRUE)"
-        ))
+            f"WHERE {q(SHARED_COLUMN)} IS NOT TRUE"
+        )).rowcount
+    logger.warning("[ddl] 表 %s 的 %d 行已标记为共享（对所有租户可见）",
+                   table_name, int(n or 0))
+    return int(n or 0)
 
 
 def create_or_replace_table(

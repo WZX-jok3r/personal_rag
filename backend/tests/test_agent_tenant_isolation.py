@@ -72,10 +72,29 @@ class TestKbSearchEnforcesTenant:
         assert f[TF] == "tenant-b", "调用方传的租户键覆盖了 principal，存在越权"
         assert f["format"] == "xlsx", "普通业务过滤条件不应被丢弃"
 
-    def test_empty_tenant_string_still_filtered(self, tools):
-        """空串也是有效值（fail-closed 下匹配不到任何租户），不能被当成 None。"""
+    def test_empty_tenant_treated_as_no_tenant(self, tools):
+        """空串按"无租户"处理（不注入过滤），而不是注入 `tenant_id=""`。
+
+        ## 语义变更说明（安全考虑）
+
+        本条原先断言"空串也注入 `{tenant_id: ''}`"，理由是"fail-closed 下
+        空串匹配不到任何租户"。那个理由是**错的** —— 实测发现：
+
+            只要某行的 tenant_id 也是空串（例如列默认值为 ''），
+            `'' = ''` 就成立 ⇒ 那些行对被判为"空租户"的调用者**可见**。
+
+        也就是说"用空串当身份"不是 fail-closed，而是**恰好打开了所有
+        空归属数据**。因此现在统一把空串归到"无租户"（等价于鉴权软关闭），
+        且未归属数据的列默认值也改成了不可匹配的哨兵
+        （见 ddl.UNOWNED_TENANT）—— 两道一起保证空归属数据不会被误读。
+        """
         tools.kb_search("问题", tenant_id="")
-        assert tools._recording.calls[0]["filter"] == {TF: ""}
+        assert tools._recording.calls[0]["filter"] is None
+
+    def test_whitespace_tenant_treated_as_no_tenant(self, tools):
+        """纯空白同样按无租户处理，避免 `" "` 这种意外身份。"""
+        tools.kb_search("问题", tenant_id="   ")
+        assert tools._recording.calls[0]["filter"] is None
 
 
 class TestDispatchPropagatesTenant:
@@ -143,3 +162,92 @@ class TestNoPathBypassesTenantFilter:
         p = Principal(tenant_id="tenant-c", authenticated=True)
         f = enforced_filter({TF: "tenant-a"}, p)
         assert f[TF] == "tenant-c", "enforced_filter 未以 principal 为准"
+
+
+class TestSingleAclImplementation:
+    """两条通道必须共用**同一个**租户过滤实现，不允许各写一份。
+
+    这是"两通道不对称"的根治点：Agent 那条原先自己拼 filter 且漏了租户
+    ⇒ 跨租户泄露。只修当前这一处没有意义，**必须消除"第二份实现"**，
+    否则下次加通道还会漂移。
+    """
+
+    def test_both_channels_delegate_to_apply_tenant_acl(self):
+        """经典 RAG 与 Agent 都必须走 security.apply_tenant_acl。"""
+        import inspect
+
+        from app.agent.tools import AgentTools
+        from app.api import deps
+
+        for fn in (deps.enforced_filter, AgentTools.kb_search):
+            src = inspect.getsource(fn)
+            assert "apply_tenant_acl" in src, (
+                f"{fn.__qualname__} 没有走统一入口 apply_tenant_acl —— "
+                f"出现了第二份租户过滤实现，会再次漂移"
+            )
+
+    def test_apply_tenant_acl_is_the_only_place_writing_tenant_key(self):
+        """**检索路径**里，除 security.apply_tenant_acl 外不应有代码写入租户键。
+
+        扫描范围只限"构造检索过滤条件"的模块：
+          - `api/`（HTTP 层：经典 RAG 路由与依赖）
+          - `agent/`（Agent 工具层）
+          - `rag/`（检索管线）
+
+        ⚠️ 局限（刻意写明，避免这个测试被误当成万能的）：
+        这是**基于文本的**静态检查，只看"是否出现 `[tenant_field] = ...`"。
+        其它模块里合法的同名写法会被误判 —— 实测就撞到一次：
+        `worker/tasks/ingest.py` 里的 `analytics_sync["tenant_id"] = upload_tenant`
+        是**给任务返回值记一个字段**，与检索过滤无关。
+        所以这里限定范围，而不是做全仓扫描 + 白名单（那会越滚越长）。
+        """
+        import re
+        from pathlib import Path
+
+        app_dir = Path(__file__).resolve().parent.parent / "app"
+        scan_roots = ["api", "agent", "rag"]
+        allowed = {"core/security.py"}
+        pattern = re.compile(
+            r"\[(settings\.tenant_field|\"tenant_id\"|'tenant_id')\]\s*="
+        )
+
+        scanned, offenders = [], []
+        for root in scan_roots:
+            for path in (app_dir / root).rglob("*.py"):
+                rel = path.relative_to(app_dir).as_posix()
+                if rel in allowed:
+                    continue
+                scanned.append(rel)
+                for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                    stripped = line.strip()
+                    if stripped.startswith("#"):
+                        continue
+                    if pattern.search(stripped):
+                        offenders.append(f"{rel}:{i}: {stripped}")
+
+        assert scanned, "扫描范围为空 —— 测试本身失效了"
+        assert not offenders, (
+            "检索路径里出现了 security.apply_tenant_acl 之外的租户键写入"
+            "（应改为调用统一入口，否则会再次出现两通道漂移）：\n  "
+            + "\n  ".join(offenders)
+        )
+
+    def test_apply_tenant_acl_cannot_be_overridden(self):
+        """客户端/模型传的租户键必须被丢弃（防伪造越权）。"""
+        from app.core.security import apply_tenant_acl
+
+        out = apply_tenant_acl({TF: "attacker"}, "real-tenant")
+        assert out[TF] == "real-tenant"
+        assert out.get("format") is None
+
+    def test_apply_tenant_acl_keeps_non_tenant_filters(self):
+        from app.core.security import apply_tenant_acl
+
+        out = apply_tenant_acl({"format": "xlsx"}, "real-tenant")
+        assert out == {TF: "real-tenant", "format": "xlsx"}
+
+    def test_apply_tenant_acl_none_tenant_returns_business_filter(self):
+        from app.core.security import apply_tenant_acl
+
+        assert apply_tenant_acl({"format": "xlsx"}, None) == {"format": "xlsx"}
+        assert apply_tenant_acl(None, None) is None

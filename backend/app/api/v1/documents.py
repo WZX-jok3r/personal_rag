@@ -88,9 +88,11 @@ async def upload_document(
 )
 async def get_ingest_status(
     task_id: str,
+    principal: Principal = Depends(get_principal),
     svc: IngestionService = Depends(get_ingestion_service),
 ) -> TaskStatusResponse:
-    return TaskStatusResponse(**await svc.get_status(task_id))
+    # 传 principal.tenant_id 做归属校验：跨租户任务一律 404（不区分"不存在"与"无权限"）
+    return TaskStatusResponse(**await svc.get_status(task_id, principal.tenant_id))
 
 
 @router.get(

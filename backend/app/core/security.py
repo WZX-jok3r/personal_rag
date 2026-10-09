@@ -38,6 +38,51 @@ KNOWN_ROLES = frozenset({ROLE_ANALYST, ROLE_EMPLOYEE})
 PRIVILEGED_ROLES = frozenset({ROLE_ANALYST})
 
 
+def apply_tenant_acl(
+    client_filter: Optional[dict],
+    tenant_id: Optional[str],
+) -> Optional[dict]:
+    """**唯一的租户过滤器构造入口**：把主体租户强制叠加到检索过滤条件上。
+
+    ## 为什么要抽成一个函数（由真实跨租户泄露驱动）
+
+    这个逻辑原先存在于**两个地方**，各写各的：
+      1. `api/deps.enforced_filter()` —— 经典 RAG 路径用
+      2. `agent/tools.kb_search()` 内联构造 —— Agent 路径用
+
+    结果 Agent 那条**漏了租户**（`dispatch` 没把 tenant_id 传下去），
+    于是 Agent 检索完全不做过滤，**能看到所有租户的私有向量**。
+    实测：租户 c 通过 `/agent/stream` 拿到了租户 b 私有上传的数据，
+    而同样问题走 `/chat/stream` 却被正确挡住（hidden_count=4）。
+
+    这类缺陷的根因不是"某一行写错"，而是**同一策略有两份实现** ——
+    只要有两份，就一定会漂移。所以收敛到这一个函数，
+    并用 `tests/test_agent_tenant_isolation.py` 的结构性断言
+    保证不再出现"自己拼 filter"的第三条路径。
+
+    ## 语义
+
+    - 客户端/模型传的租户键**一律丢弃**（不可覆盖，防伪造越权）
+    - 非租户的业务过滤条件（如 format）保留
+    - `tenant_id` 为 None（鉴权软关闭）时不注入 —— 与既有行为一致
+    - 空串视为"无租户"，同样不注入（避免 `'' = ''` 式意外匹配）
+
+    Args:
+        client_filter: 调用方给的过滤条件（可为 None）
+        tenant_id: 已认证主体的租户；None/空串表示不做租户过滤
+
+    Returns:
+        合并后的过滤条件；无任何条件时返回 None（Retriever 视为不过滤）
+    """
+    merged: dict = dict(client_filter or {})
+    # 先无条件丢弃客户端传的租户键 —— 顺序很重要，必须在写入之前
+    merged.pop(settings.tenant_field, None)
+    tid = (tenant_id or "").strip()
+    if tid:
+        merged[settings.tenant_field] = tid
+    return merged or None
+
+
 @dataclass
 class Principal:
     """已解析的调用方身份。

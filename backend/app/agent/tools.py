@@ -198,12 +198,12 @@ class AgentTools:
         宁可少召回，不可跨租户泄露。
         """
         k = int(top_k) if top_k else settings.top_k
-        # 强制租户隔离：先丢弃调用方可能传入的租户键，再按 principal 写入
-        merged: Dict[str, Any] = dict(filter_dict or {})
-        merged.pop(settings.tenant_field, None)
-        if tenant_id is not None:
-            merged[settings.tenant_field] = tenant_id
-        effective_filter = merged or None
+        # 租户隔离：调用**唯一的过滤构造入口**，不再就地拼 filter。
+        # 这里曾经自己拼（且 dispatch 忘了传 tenant_id）导致跨租户泄露，
+        # 详见 security.apply_tenant_acl 的说明。
+        from app.core.security import apply_tenant_acl
+
+        effective_filter = apply_tenant_acl(filter_dict, tenant_id)
 
         try:
             chunks, dropped = self.retriever.search(

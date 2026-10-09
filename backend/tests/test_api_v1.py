@@ -101,7 +101,17 @@ class FakeIngestion:
         self.submitted.append((str(file_path), tenant_id, tenant_ids))
         return "task_test_123"
 
-    async def get_status(self, task_id):
+    async def get_status(self, task_id, tenant_id=None):
+        """签名必须跟着真实服务走。
+
+        ⚠️ 这里此前是 `get_status(self, task_id)`，加了租户归属校验后立刻报
+        "takes 2 positional arguments but 3 were given"。
+        按 L-014 的规则，替身**不要用 **kwargs 吞参数** ——
+        吞掉会让"忘了传租户"这类缺陷静默通过，
+        而它恰恰就是本项目出过的跨租户泄露形态。
+        保持显式签名，让签名漂移在测试期就炸出来。
+        """
+        self.last_status_query = (task_id, tenant_id)
         return {
             "task_id": task_id, "document_id": None,
             "status": "queued", "progress": 0, "error": None,

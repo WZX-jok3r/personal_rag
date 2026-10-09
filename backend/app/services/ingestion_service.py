@@ -93,10 +93,21 @@ class IngestionService:
         logger.info("[Ingest] 已入队 task_id=%s file=%s", task_id, path.name)
         return task_id
 
-    async def get_status(self, task_id: str) -> Dict[str, Any]:
-        """查询任务状态（供前端轮询进度）。不存在抛 NotFoundError。"""
+    async def get_status(
+        self, task_id: str, tenant_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """查询任务状态（供前端轮询进度）。不存在抛 NotFoundError。
+
+        `tenant_id` 非空时**同时做归属校验**：跨租户一律视为"不存在"（404），
+        避免已认证用户枚举/窥探他人任务（返回体含 document_id 与 error，
+        而 error 里可能带文件名/表名）。
+
+        ⚠️ 这个缺口与 Agent 检索那次泄露同源：**同一份代码里
+        `/documents` 列表与删除都做了租户校验，只有状态查询漏了**。
+        修"某一处"没用，所以顺手把 ingest 任务的状态查询也纳入统一口径。
+        """
         async with self._sm() as s:
-            task = await IngestTaskRepository(s).get(task_id)
+            task = await IngestTaskRepository(s).get(task_id, tenant_id)
             if task is None:
                 raise NotFoundError(f"ingest task {task_id} not found")
             return {

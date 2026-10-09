@@ -142,6 +142,31 @@ USING (is_shared IS TRUE OR tenant_id = current_setting('app.tenant_id', true))
 > 与 `tests/test_agent_tenant_isolation.py`（含结构性防复发断言：
 > 穷举代码库所有 `retriever.search(` 调用点，新增未受控路径直接失败）。
 
+### 两个"唯一入口"（收敛重复实现）
+
+上面那次泄露的**根因不是某一行写错，而是同一策略有两份实现**
+（经典 RAG 用 `deps.enforced_filter`，Agent 自己拼 filter）。
+只要有两份，就一定会漂移。因此现在收敛为两个唯一入口：
+
+| 入口 | 职责 | 约束 |
+|---|---|---|
+| `security.apply_tenant_acl(filter, tenant_id)` | 构造检索/数据过滤条件 | 客户端/模型传的租户键**一律丢弃**；`None`/空串不注入 |
+| `executor.resolve_tenant_identity(tenant_id)` | 规范化"调用方是谁" | 保留值（空串、两个哨兵）一律按匿名处理 |
+
+`resolve_tenant_identity` 的存在是因为踩了**两轮同一个坑**：
+
+1. 列默认值原为 `''` ⇒ 某条路径用空串当身份时 `'' = ''` 成立
+   ⇒ **全部未归属行可见**（实测过）；
+2. 改成 `'@unowned@'` 后，用 `'@unowned@'` 当身份**又能匹配**
+   ⇒ 同样的洞换个字符串再来一次。
+
+**结论：只要某个值会被写进 `tenant_id` 列，它就能被同值身份匹配到 ——
+"挑一个特殊字符串"不构成安全边界，边界必须在入口用显式拒绝建立。**
+
+> 同类口径也补到了入库任务状态查询：`GET /documents/{task_id}/status`
+> 原先只按 id 查（任何已认证方都能查他人任务，返回体含 `document_id`/`error`），
+> 现在跨租户返回 **404**（不区分"不存在"与"无权限"，避免用状态码探测存在性）。
+
 **44 条攻击载荷全部拦截**（含 `DROP`、多语句注入、`pg_shadow`、文件读写、命令执行、
 注释混淆、大小写/空白变体），22 条合法查询全部放行。
 
@@ -209,7 +234,7 @@ Google ADK / DB-GPT）后决定手写约 300 行有界状态机。理由：只�
 | **Valid SQL Rate** | 100%（42/42） | 同上 |
 | **平均生成次数** | 1.00（一次生成即正确） | 同上 |
 | **检索 Recall@5 / MRR** | 99.01% / 0.9703（107 题） | `python -m eval --retrieval-only` |
-| **单测** | **597 passed** | `pytest -q` |
+| **单测** | **628 passed** | `pytest -q` |
 | **SQL 攻击载荷拦截** | 44/44 | `pytest tests/test_sql_guard.py` |
 | **端到端延迟** | SQL 查询 2~5ms；检索路径首帧 <1s | `scripts/check.ps1 -Full` |
 
@@ -314,11 +339,11 @@ backend/
 │   ├── rag/ vector/ ingestion/ llm/ worker/     # 原有 RAG 链路（基本未改）
 │   └── core/             # config / security(RBAC) / retry / exceptions
 ├── eval/                 # 两个评测 runner + 冻结基线
-├── tests/                # 597 项测试
+├── tests/                # 628 项测试
 └── migrations/           # Alembic（元数据表 / 审计 / 用量）
 frontend/src/             # Vue3 SPA（AgentTrace / MessageBubble / ChatView）
 scripts/check.ps1         # 三级验证闸口
-docs/                     # 改造方案 + 数据层设计 + 经验教训（20 条）
+docs/                     # 改造方案 + 数据层设计 + 经验教训（21 条）
 ```
 
 ---
@@ -343,7 +368,7 @@ docs/                     # 改造方案 + 数据层设计 + 经验教训（20 �
 
 ## 九、工程实践与踩坑记录
 
-本项目把**真实踩过的坑**沉淀成了 [docs/经验教训.md](docs/经验教训.md)（20 条），
+本项目把**真实踩过的坑**沉淀成了 [docs/经验教训.md](docs/经验教训.md)（21 条），
 每条都是"现象 → 根因 → 处置 → 可执行的规避规则"。几条最有代表性的：
 
 | # | 坑 | 教训 |
@@ -378,6 +403,6 @@ docs/                     # 改造方案 + 数据层设计 + 经验教训（20 �
 |---|---|
 | [docs/升级为内部知识库Agent-完整改造方案.md](docs/升级为内部知识库Agent-完整改造方案.md) | 完整改造方案：结构梳理、优缺点诊断、可行性调研、8 阶段计划、简历包装 |
 | [docs/text2sql-数据层设计.md](docs/text2sql-数据层设计.md) | 可直接执行的 DDL、只读角色、RLS、ETL 与数据源边界 |
-| [docs/经验教训.md](docs/经验教训.md) | 20 条真实踩坑记录与方法学规则 |
+| [docs/经验教训.md](docs/经验教训.md) | 21 条真实踩坑记录与方法学规则 |
 | [docs/项目全景深度解析.md](docs/项目全景深度解析.md) | 原有 RAG 模块逐一梳理与端到端调用链 |
 | [docs/RAG面试题库_初中高60题.md](docs/RAG面试题库_初中高60题.md) | RAG 面试题库 |

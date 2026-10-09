@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache.redis import SessionCache
 from app.core.config import settings
-from app.core.security import Principal, resolve_principal
+from app.core.security import Principal, apply_tenant_acl, resolve_principal
 from app.database import db
 from app.rag.pipeline import RAGPipeline
 from app.services.ingestion_service import IngestionService
@@ -77,12 +77,10 @@ def enforced_filter(
 ) -> Optional[dict]:
     """服务端强制叠加租户隔离（迁移自 src/api.py）。
 
-    - 客户端可传普通业务过滤（如 format），但绝不能覆盖租户键；
-    - tenant_id 以已认证 Principal 为准（后写覆盖）；
-    - 鉴权关闭时 principal.tenant_id 为 None，不注入租户条件。
+    ⚠️ 本函数现在只是**统一实现** `security.apply_tenant_acl` 的薄封装。
+    租户过滤的构造逻辑集中在那一个函数里 —— 因为它原先在
+    `deps.enforced_filter` 与 `agent/tools.kb_search` 各写了一份，
+    而 Agent 那份漏了租户，导致跨租户泄露（见 apply_tenant_acl 的说明）。
+    **不要在这里重新实现过滤逻辑。**
     """
-    merged = dict(client_filter or {})
-    merged.pop(settings.tenant_field, None)
-    if principal.tenant_id is not None:
-        merged[settings.tenant_field] = principal.tenant_id
-    return merged or None
+    return apply_tenant_acl(client_filter, principal.tenant_id)

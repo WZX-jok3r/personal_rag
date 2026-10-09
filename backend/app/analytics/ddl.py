@@ -35,8 +35,25 @@ logger = logging.getLogger(__name__)
 TENANT_COLUMN = "tenant_id"
 TENANT_GUC = "app.tenant_id"
 
-# 演示数据的默认租户：语料是全公司共享数据，未认证时归属此值
-DEFAULT_TENANT = "a"
+# "共享语料"标记列。
+#
+# ## 为什么需要它（一次真实安全问题的产物）
+#
+# 本项目有两类结构化数据，最初的 RLS 策略无法区分，导致两个真实漏洞：
+#   ① **租户私有数据**（某个租户通过 API 上传的 xlsx）—— 必须只有该租户可见
+#   ② **全公司共享语料**（demo 知识库、公司级报表）—— 应该所有租户可见
+#
+# 最初只有一个 tenant_id 列，且 RLS 写成"会话变量未设置 ⇒ 放行全部"。后果：
+#   - ETL 把上传数据的 tenant_id 一律写成 DEFAULT_TENANT('a')
+#     ⇒ 租户 b 上传后查不到自己的数据（表现为"传了但查不到"）
+#   - 一旦执行路径没设置 app.tenant_id（`if tenant_id:` 在 None 时跳过）
+#     ⇒ 策略放行**所有行**，租户 b 能看到全公司薪资（跨租户可见）
+#
+# 修复思路：把"归属"和"可见性"两个概念拆开
+#   - `tenant_id`：数据归属（谁传的）
+#   - `is_shared`：是否全公司共享（默认 false）
+# 并让策略**默认拒绝**：只有 is_shared 或 tenant_id 匹配才放行。
+SHARED_COLUMN = "is_shared"
 
 
 def q(identifier: str) -> str:
@@ -61,7 +78,10 @@ def build_create_table_sql(schema: InferredSchema, tenant_column: bool = True) -
         lines.append(" ".join(parts))
 
     if tenant_column:
-        lines.append(f'  {q(TENANT_COLUMN)} VARCHAR(64) NOT NULL DEFAULT \'{DEFAULT_TENANT}\'')
+        # tenant_id 用 '' 而非固定值兜底：空归属比"错误地归属到某个租户"更安全，
+        # 因为 fail-closed 策略下 '' 谁都匹配不到（除非 is_shared）。
+        lines.append(f"  {q(TENANT_COLUMN)} VARCHAR(64) NOT NULL DEFAULT ''")
+        lines.append(f"  {q(SHARED_COLUMN)} BOOLEAN NOT NULL DEFAULT FALSE")
 
     if pk_cols:
         lines.append(f"  PRIMARY KEY ({', '.join(q(c) for c in pk_cols)})")
@@ -99,9 +119,29 @@ def build_comments_sql(schema: InferredSchema) -> List[str]:
 def build_rls_sql(table_name: str) -> List[str]:
     """启用 RLS 并绑定 app.tenant_id 会话变量。
 
-    策略语义（重要，见模块 docstring）：
-      - `app.tenant_id` 未设置（NULL）→ 放行全部行（匿名/评测/演示）
-      - `app.tenant_id` 已设置        → 只放行 tenant_id 匹配的行（硬隔离）
+    ## 策略语义（**fail-closed**，这是修复安全问题的关键）
+
+    只有满足以下**任一**条件才放行：
+      1. `is_shared = true` —— 全公司共享语料（demo 知识库、公司级报表）
+      2. `tenant_id = current_setting('app.tenant_id')` —— 本租户私有数据
+
+    否则**一律拒绝**。
+
+    ## 为什么改成 fail-closed（原策略是 fail-open，有真实漏洞）
+
+    原策略写成：
+        `app.tenant_id` IS NULL OR = '' OR tenant_id = app.tenant_id
+    即"会话变量没设置就放行全部"。当时理由是"未认证时看全部，与 RAG 侧软关闭一致"。
+    但它有一个致命后果：
+        **任何忘记设置 app.tenant_id 的执行路径都会拿到全量数据。**
+    实测确证：执行器里写的是 `if tenant_id:` —— 当 tenant_id 为 None 时
+    根本不设置变量，于是策略放行所有行，租户 b 能看到全公司薪资。
+
+    现在改为 fail-closed：忘设变量 ⇒ 只放行 is_shared 的行（共享语料），
+    拿不到任何租户私有数据。**忘设只损失功能，不泄露数据。**
+
+    注：`current_setting(..., true)` 在未设置时返回 NULL，
+    所以未设变量时条件 2 为 NULL（不成立），自然落到"拒绝" —— 正是我们要的。
     """
     return [
         f"ALTER TABLE {q(table_name)} ENABLE ROW LEVEL SECURITY",
@@ -110,16 +150,54 @@ def build_rls_sql(table_name: str) -> List[str]:
         (
             f"CREATE POLICY {q(f'tenant_isolation_{table_name}')} ON {q(table_name)} "
             f"USING ("
-            f"  current_setting('{TENANT_GUC}', true) IS NULL "
-            f"  OR current_setting('{TENANT_GUC}', true) = '' "
+            f"  {q(SHARED_COLUMN)} IS TRUE "
             f"  OR {q(TENANT_COLUMN)} = current_setting('{TENANT_GUC}', true)"
             f")"
         ),
     ]
 
 
-def create_or_replace_table(engine: Engine, schema: InferredSchema) -> None:
-    """建表 + 注释 + 索引 + RLS。**会先 DROP 再建**（重灌语义）。"""
+def ensure_tenant_columns(engine: Engine, table_name: str) -> None:
+    """为**已存在**的表补齐 tenant_id / is_shared 两列（幂等）。
+
+    为什么需要它：
+        `create_or_replace_table` 会 DROP 重建，因此新表天然带两列；
+        但**升级前就已存在**的表（例如之前在旧策略下建的 demo 语料表）
+        没有 `is_shared` 列 —— 此时新的 RLS 策略引用它会直接报
+        `column "is_shared" does not exist`，导致整表不可读。
+
+    语义处理：补列时把 is_shared 设为 **true**（这些表是升级前建的共享语料），
+    并保留各自原有的 tenant_id 值。这样升级后它们仍对所有租户可见，
+    不会因为策略收紧而"突然消失"。
+    """
+    stmts = [
+        f"ALTER TABLE {q(table_name)} "
+        f"ADD COLUMN IF NOT EXISTS {q(TENANT_COLUMN)} VARCHAR(64) NOT NULL DEFAULT ''",
+        f"ALTER TABLE {q(table_name)} "
+        f"ADD COLUMN IF NOT EXISTS {q(SHARED_COLUMN)} BOOLEAN NOT NULL DEFAULT FALSE",
+    ]
+    with engine.begin() as conn:
+        for stmt in stmts:
+            conn.execute(text(stmt))
+        # 仅在"该表还没有任何共享行"时，把存量行标记为共享（一次性升级语义）
+        conn.execute(text(
+            f"UPDATE {q(table_name)} SET {q(SHARED_COLUMN)} = TRUE "
+            f"WHERE {q(SHARED_COLUMN)} IS NOT TRUE AND NOT EXISTS ("
+            f"  SELECT 1 FROM {q(table_name)} WHERE {q(SHARED_COLUMN)} IS TRUE)"
+        ))
+
+
+def create_or_replace_table(
+    engine: Engine,
+    schema: InferredSchema,
+    tenant_id: str = "",
+    is_shared: bool = False,
+) -> None:
+    """建表 + 注释 + 索引 + RLS。**会先 DROP 再建**（重灌语义）。
+
+    注意：本函数只建**表结构**并写列注释；行数据的 tenant_id / is_shared
+    由 `seed._copy_rows` 在 COPY 时逐行写入（见该函数的 tenant_id 参数）。
+    """
     with engine.begin() as conn:
         # 重灌语义：先删旧表，保证列结构变化时不会残留旧列
         conn.execute(text(f"DROP TABLE IF EXISTS {q(schema.table_name)} CASCADE"))

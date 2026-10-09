@@ -91,7 +91,7 @@ class TestAnalyticsSyncIsWired:
     async def test_xlsx_triggers_analytics_sync(self, monkeypatch, tmp_path):
         calls: List[Path] = []
 
-        def fake_sync(path: Path):
+        def fake_sync(path, tenant_id="", is_shared=False):
             calls.append(path)
 
             class R:
@@ -121,7 +121,7 @@ class TestAnalyticsSyncIsWired:
         """非表格文件不应触发 —— PDF 表格提取是启发式的，建表会引入静默错误。"""
         calls: List[Path] = []
         monkeypatch.setattr("app.analytics.seed.sync_analytics_tables",
-                            lambda p: calls.append(p) or [])
+                            lambda p, tenant_id="", is_shared=False: calls.append(p) or [])
 
         f = tmp_path / "doc.pdf"
         f.write_bytes(b"x")
@@ -138,7 +138,7 @@ class TestAnalyticsSyncIsWired:
 
         calls: List[Path] = []
         monkeypatch.setattr("app.analytics.seed.sync_analytics_tables",
-                            lambda p: calls.append(p) or [])
+                            lambda p, tenant_id="", is_shared=False: calls.append(p) or [])
         monkeypatch.setattr(settings, "analytics_sync_on_ingest", False)
 
         f = tmp_path / "data.xlsx"
@@ -161,7 +161,7 @@ class TestAnalyticsFailureIsIsolated:
 
     @pytest.mark.asyncio
     async def test_sync_failure_does_not_fail_task(self, monkeypatch, tmp_path):
-        def boom(path):
+        def boom(path, tenant_id="", is_shared=False):
             raise RuntimeError("analytics db down")
 
         monkeypatch.setattr("app.analytics.seed.sync_analytics_tables", boom)
@@ -198,11 +198,87 @@ class TestAnalyticsFailureIsIsolated:
         assert TaskStatus.FAILED.value in statuses
 
 
+class TestTenantIsPropagatedToEtl:
+    """**核心**：上传租户必须一路传到 ETL 的行数据（用户指出的必修尾项）。
+
+    初版 `sync_analytics_tables(path)` 只接路径，tenant_id 被硬编码成固定的 'a'。
+    后果是两个问题：
+      - 租户 b 上传的 xlsx 行上盖 'a' ⇒ b 查不到自己刚传的数据
+      - 旧 RLS 是 fail-open ⇒ 未设变量时跨租户可见（实测能看到全公司薪资）
+    且当时 E2E 用 demo key（租户 a）验证，恰好等于那个硬编码值，
+    **所以这个 bug 在测试矩阵里完全不可见** —— 本测试就是为了让它可见。
+    """
+
+    @pytest.mark.asyncio
+    async def test_tenant_b_upload_passes_b_to_etl(self, monkeypatch, tmp_path):
+        seen: List[Any] = []
+
+        def fake_sync(path, tenant_id="", is_shared=False):
+            seen.append({"path": path, "tenant_id": tenant_id, "is_shared": is_shared})
+            return []
+
+        monkeypatch.setattr("app.analytics.seed.sync_analytics_tables", fake_sync)
+
+        f = tmp_path / "b_data.xlsx"
+        f.write_bytes(b"x")
+        out = await ingest_document(_ctx(lambda *a, **k: _ok_record()),
+                                    str(f), "tb", ["test-tenant-b"])
+
+        assert len(seen) == 1
+        assert seen[0]["tenant_id"] == "test-tenant-b", (
+            f"ETL 收到的租户应为 test-tenant-b，实际 {seen[0]['tenant_id']!r} —— "
+            f"若为空或固定值，租户 b 将查不到自己上传的数据"
+        )
+        assert seen[0]["is_shared"] is False, "上传的租户私有数据不应被标记为共享"
+        assert out["analytics_sync"]["tenant_id"] == "test-tenant-b"
+
+    @pytest.mark.asyncio
+    async def test_no_tenant_is_recorded_and_warned(self, monkeypatch, tmp_path, caplog):
+        """没有租户信息时必须留下痕迹，而不是静默写入"无归属"数据。
+
+        无归属数据在 fail-closed 策略下谁都读不到 —— 若静默写入，
+        用户会遇到"传了但查不到"且无从排查。
+        """
+        seen: List[Any] = []
+        monkeypatch.setattr("app.analytics.seed.sync_analytics_tables",
+                            lambda p, tenant_id="", is_shared=False:
+                            seen.append(tenant_id) or [])
+
+        f = tmp_path / "anon.xlsx"
+        f.write_bytes(b"x")
+        with caplog.at_level("WARNING"):
+            out = await ingest_document(_ctx(lambda *a, **k: _ok_record()),
+                                        str(f), "tn", None)
+
+        assert seen == [""], "无租户时应传空串（无归属），而不是硬编码兜底值"
+        assert out["analytics_sync"]["tenant_id"] == ""
+        # 用 getMessage() 而不是手工 % 格式化 —— 后者在 args 数量不匹配时会抛
+        # TypeError，把"断言日志内容"变成"测试自己崩"
+        assert any("没有租户信息" in r.getMessage() for r in caplog.records), (
+            "缺少『无租户』告警：无归属数据在 fail-closed 下谁都读不到，"
+            "必须留痕迹而不是静默写入"
+        )
+
+    @pytest.mark.asyncio
+    async def test_tenant_first_of_list_is_used(self, monkeypatch, tmp_path):
+        """多租户上传时取第一个（与 Document 登记口径一致）。"""
+        seen: List[Any] = []
+        monkeypatch.setattr("app.analytics.seed.sync_analytics_tables",
+                            lambda p, tenant_id="", is_shared=False:
+                            seen.append(tenant_id) or [])
+
+        f = tmp_path / "multi.xlsx"
+        f.write_bytes(b"x")
+        await ingest_document(_ctx(lambda *a, **k: _ok_record()), str(f), "tm",
+                              ["first-tenant", "second-tenant"])
+        assert seen == ["first-tenant"]
+
+
 class TestReturnValueShape:
     @pytest.mark.asyncio
     async def test_record_fields_preserved(self, monkeypatch, tmp_path):
         """原有返回字段必须保留（不能因为加了 analytics_sync 就丢掉它们）。"""
-        monkeypatch.setattr("app.analytics.seed.sync_analytics_tables", lambda p: [])
+        monkeypatch.setattr("app.analytics.seed.sync_analytics_tables", lambda p, tenant_id="", is_shared=False: [])
         f = tmp_path / "data.xlsx"
         f.write_bytes(b"x")
         rec = _ok_record()

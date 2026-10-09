@@ -41,6 +41,12 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# 未认证/无租户时使用的哨兵值。
+# 它**不可能**与任何真实租户名相同（含 '@' 前缀且带标记），
+# 因此在 fail-closed 的 RLS 策略下只能匹配到 is_shared 的共享语料，
+# 拿不到任何租户私有数据。
+ANONYMOUS_TENANT = "@anonymous@"
+
 
 @dataclass
 class QueryResult:
@@ -140,11 +146,25 @@ class SqlExecutor:
             text("SELECT set_config('statement_timeout', :t, true)"),
             {"t": f"{self.timeout_ms}ms"},
         )
-        # 3) RLS：设置租户变量触发行级隔离（true = 事务结束后失效）
-        if tenant_id:
-            conn.execute(
-                text("SELECT set_config('app.tenant_id', :v, true)"), {"v": tenant_id}
-            )
+        # 3) RLS：**无条件**设置租户变量（fix：一次真实的越权问题）
+        #
+        # ⚠️ 原写法是 `if tenant_id:` —— 当 tenant_id 为 None 时**根本不设置变量**。
+        #    而旧的 RLS 策略是 fail-open 的（"变量未设置 ⇒ 放行全部行"），
+        #    于是"未认证/无租户"的请求会读到**所有租户**的数据。
+        #    实测确证：以租户 b 身份但在未设变量的路径上查询，
+        #    能看到全公司 10000 行薪资。
+        #
+        #    现在两道一起改：
+        #      - 策略改为 fail-closed（见 ddl.build_rls_sql）：只有
+        #        is_shared 或 tenant_id 匹配才放行；
+        #      - 这里**永远**设置变量，未认证时用一个不可能匹配到任何租户的哨兵值，
+        #        从而只能读到 is_shared 的共享语料。
+        #    这样"忘设变量"不再是漏洞（fail-closed 兜底），
+        #    而"没租户"也语义明确：只能看共享语料。
+        conn.execute(
+            text("SELECT set_config('app.tenant_id', :v, true)"),
+            {"v": tenant_id if tenant_id else ANONYMOUS_TENANT},
+        )
 
     # ---- 预检 ----
     def explain_sql(self, sql: str) -> tuple[bool, str]:

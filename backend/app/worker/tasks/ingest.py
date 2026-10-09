@@ -78,6 +78,14 @@ async def ingest_document(
     #    但先前只交付了手动 CLI，worker 未接线 —— 后果是**通过 API 上传的 xlsx
     #    不会出现在 SQL 侧**：RAG 能检索到、SQL 查不到，两条通道静默不一致。
     #
+    # ⚠️⚠️ tenant_id 必须**从任务参数传到行数据上**（第二个被漏掉的实现）：
+    #    初版 sync_analytics_tables 只接 path，把 tenant_id 硬编码成固定的 'a'。
+    #    后果（已实测确证）：
+    #      - 租户 b 上传的 xlsx 行上盖 'a' ⇒ b 查不到自己刚传的数据
+    #      - 旧 RLS 策略在会话变量未设置时放行全部 ⇒ 跨租户可见
+    #    因此这里显式取 `tenant_ids[0]`（与上面 Document 登记用的是同一来源），
+    #    保证"谁上传的，数据就归属谁"。
+    #
     # 关键设计：本步骤**失败不影响主流程**（不 re-raise）。
     #   理由：向量化成功即 RAG 侧可用；SQL 侧同步失败只应降级为"该文件暂时查不了"，
     #   不该让整个入库任务失败并触发 ARQ 重试（重试会重复做一遍向量化，代价高）。
@@ -85,18 +93,31 @@ async def ingest_document(
     analytics_sync: Dict[str, Any] = {"attempted": False}
     if settings.analytics_sync_on_ingest and should_sync_to_analytics(Path(file_path)):
         analytics_sync["attempted"] = True
+        upload_tenant = tenant_ids[0] if tenant_ids else ""
+        analytics_sync["tenant_id"] = upload_tenant
+        if not upload_tenant:
+            # 鉴权关闭或未带租户时，不要静默按"无归属"写入 ——
+            # 无归属数据在 fail-closed 策略下谁都读不到，属于"传了但查不到"，
+            # 必须留下明确痕迹，而不是让用户莫名其妙。
+            logger.warning(
+                "[IngestJob] 任务 %s 没有租户信息，SQL 侧数据将无归属"
+                "（fail-closed 策略下将不可读）—— 请检查鉴权配置",
+                task_id,
+            )
         try:
             from app.analytics.seed import sync_analytics_tables
 
-            results = await asyncio.to_thread(sync_analytics_tables, Path(file_path))
+            results = await asyncio.to_thread(
+                sync_analytics_tables, Path(file_path), upload_tenant
+            )
             analytics_sync["ok"] = True
             analytics_sync["tables"] = [
                 {"table": r.table_name, "sheet": r.sheet_name,
                  "rows": r.row_count, "columns": r.column_count}
                 for r in results
             ]
-            logger.info("[IngestJob] 任务 %s 已同步 %d 张表到 SQL 侧: %s",
-                        task_id, len(results),
+            logger.info("[IngestJob] 任务 %s 已同步 %d 张表到 SQL 侧（租户=%s）: %s",
+                        task_id, len(results), upload_tenant or "(无)",
                         ", ".join(r.table_name for r in results))
         except Exception as e:  # noqa: BLE001
             analytics_sync["ok"] = False

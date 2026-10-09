@@ -136,14 +136,32 @@ class LoadResult:
     columns: List[str] = field(default_factory=list)
 
 
-def _copy_rows(engine: Engine, schema: InferredSchema, rows: List[List[str]]) -> tuple[int, int]:
+def _copy_rows(
+    engine: Engine,
+    schema: InferredSchema,
+    rows: List[List[str]],
+    tenant_id: str = "",
+    is_shared: bool = False,
+) -> tuple[int, int]:
     """用 COPY 批量装载。返回 (成功行数, 跳过行数)。
 
     用 COPY 而不是逐行 INSERT：万行级差距是秒级 vs 分钟级。
     通过 psycopg 的 copy 接口流式写入，避免把整个数据集拼成巨型 SQL。
+
+    ## tenant_id / is_shared 必须由调用方传入（一次真实安全问题的修复）
+
+    初版把 tenant_id 硬编码成 `ddl.DEFAULT_TENANT`（固定 'a'），
+    且没有 is_shared 概念。后果（已实测确证）：
+      - 租户 b 上传的 xlsx，行上盖的是 'a' ⇒ **b 查不到自己刚传的数据**
+      - 而 RLS 原策略在"会话变量未设置"时放行全部 ⇒ **跨租户可见**
+        （实测 tenant b 能看到全公司 10000 行薪资）
+
+    修复方式：把归属（tenant_id）与可见性（is_shared）都作为**显式参数**
+    从 worker 任务一路传下来，不再有任何硬编码兜底。
     """
     table = ddl.q(schema.table_name)
-    cols = [ddl.q(c.name) for c in schema.columns] + [ddl.q(ddl.TENANT_COLUMN)]
+    cols = ([ddl.q(c.name) for c in schema.columns]
+            + [ddl.q(ddl.TENANT_COLUMN), ddl.q(ddl.SHARED_COLUMN)])
     col_list = ", ".join(cols)
 
     loaded = skipped = 0
@@ -171,7 +189,8 @@ def _copy_rows(engine: Engine, schema: InferredSchema, rows: List[List[str]]) ->
                     if bad:
                         skipped += 1
                         continue
-                    values.append(ddl.DEFAULT_TENANT)
+                    values.append(tenant_id)
+                    values.append("true" if is_shared else "false")
                     copy.write_row(values)
                     loaded += 1
         raw_conn.commit()
@@ -189,8 +208,14 @@ def _upsert_metadata(
     source: str,
     sheet_name: str,
     row_count: int,
+    tenant_id: Optional[str] = None,
 ) -> None:
-    """写元数据到 rag 库（analytics_tables / analytics_columns）。"""
+    """写元数据到 rag 库（analytics_tables / analytics_columns）。
+
+    tenant_id 也写进元数据：`schema.load_table_schemas` 用它做 **schema 层**过滤 ——
+    这样租户 A 的模型连"租户 B 有哪些表"都不该看到。
+    与 RLS 形成两层：元数据层不可见 + 数据层不可读。
+    """
     from app.models.analytics import AnalyticsColumn, AnalyticsTable
 
     display, desc = _TABLE_DISPLAY.get(schema.table_name, (schema.display_name, schema.description))
@@ -210,6 +235,9 @@ def _upsert_metadata(
             sheet_name=sheet_name,
             row_count=row_count,
             is_enabled=True,
+            # tenant_id = NULL 表示"共享表"（所有租户可见），
+            # 与 schema.load_table_schemas 的过滤语义一致。
+            tenant_id=tenant_id,
         )
         s.add(tbl)
         s.flush()
@@ -233,8 +261,17 @@ def load_file(
     rag_engine: Engine,
     path: Path,
     skip_sheets: Optional[set[str]] = None,
+    tenant_id: str = "",
+    is_shared: bool = False,
 ) -> List[LoadResult]:
-    """把一个 xlsx 的所有 sheet 装载成表。"""
+    """把一个 xlsx 的所有 sheet 装载成表。
+
+    Args:
+        tenant_id: 数据归属租户（谁上传的）。**不再有硬编码兜底** ——
+            租户私有数据必须带上真实租户，否则 fail-closed 策略下谁都查不到。
+        is_shared: 是否全公司共享语料（demo 知识库/公司级报表用）。
+            与 tenant_id 是两个正交概念：归属 ≠ 可见性。
+    """
     skip = _SKIP_SHEETS if skip_sheets is None else skip_sheets
     results: List[LoadResult] = []
 
@@ -254,10 +291,16 @@ def load_file(
             logger.warning("[seed] %s / %s 无有效列，跳过", path.name, sheet_name)
             continue
 
-        ddl.create_or_replace_table(analytics_engine, schema)
-        loaded, skipped_rows = _copy_rows(analytics_engine, schema, rows[schema.header_row_index + 1:])
+        ddl.create_or_replace_table(
+            analytics_engine, schema, tenant_id=tenant_id, is_shared=is_shared
+        )
+        loaded, skipped_rows = _copy_rows(
+            analytics_engine, schema, rows[schema.header_row_index + 1:],
+            tenant_id=tenant_id, is_shared=is_shared,
+        )
 
-        _upsert_metadata(rag_engine, schema, path.name, sheet_name, loaded)
+        _upsert_metadata(rag_engine, schema, path.name, sheet_name, loaded,
+                         tenant_id=tenant_id or None)
 
         res = LoadResult(
             table_name=schema.table_name,
@@ -291,7 +334,11 @@ def should_sync_to_analytics(path: Path) -> bool:
     return path.suffix.lower() in {".xlsx", ".xlsm"}
 
 
-def sync_analytics_tables(path: Path) -> List[LoadResult]:
+def sync_analytics_tables(
+    path: Path,
+    tenant_id: str = "",
+    is_shared: bool = False,
+) -> List[LoadResult]:
     """把单个文件的表格同步成 SQL 表（供 ARQ worker 在入库流程中调用）。
 
     ## 为什么需要这个函数（一段被漏掉的实现）
@@ -309,7 +356,16 @@ def sync_analytics_tables(path: Path) -> List[LoadResult]:
     RAG 能检索到、SQL 查不到，两条通道静默不一致。
     本函数即为补上这一环。
 
-    ## 设计取舍
+    ## tenant_id / is_shared 必须由调用方传入（第二个被漏掉的实现）
+
+    初版签名只有 `path`，把 `tenant_id` 硬编码成固定的 'a'。后果（已实测确证）：
+      - 租户 b 上传的 xlsx 行上盖 'a' ⇒ **b 查不到自己刚传的数据**
+      - 而旧 RLS 策略在会话变量未设置时放行全部 ⇒ **跨租户可见**
+        （实测 tenant b 能看到全公司 10000 行薪资）
+    因此这里把归属与可见性都作为**必传语义**：worker 从任务参数取真实 tenant，
+    CLI 灌 demo 语料时显式声明 `is_shared=True`。
+
+    ## 其他设计取舍
 
     - **只处理 xlsx**（`should_sync_to_analytics` 判定），与既有数据源边界一致
     - **幂等**：`create_or_replace_table` 先 DROP 再建，重灌安全
@@ -320,7 +376,10 @@ def sync_analytics_tables(path: Path) -> List[LoadResult]:
     analytics_engine = create_engine(settings.sync_analytics_url)
     rag_engine = create_engine(settings.sync_postgres_url)
     try:
-        return load_file(analytics_engine, rag_engine, path)
+        return load_file(
+            analytics_engine, rag_engine, path,
+            tenant_id=tenant_id, is_shared=is_shared,
+        )
     finally:
         analytics_engine.dispose()
         rag_engine.dispose()
@@ -336,7 +395,7 @@ def sync_analytics_tables(path: Path) -> List[LoadResult]:
 #     [2..6] 数据 5 行
 #     [7] 尾部汇总脚注「汇总：铰链(28×20)、颗粒板...」（首列有值 => openpyxl 视为数据行）
 #   => 装载后 **6 行**（含 [7] 这行脚注），不是改造方案文档里估的 7 行。
-#   列数 = 7 业务列 + tenant_id = **8**。
+#   业务列 = 7 列（col_1..col_7）。
 TRUTH_CHECKS: List[tuple[str, str, Any]] = [
     ("employees", "SELECT count(*) FROM employees", 10000),
     ("employees", "SELECT count(*) FROM employees WHERE department='Sales'", 1042),
@@ -351,13 +410,19 @@ TRUTH_CHECKS: List[tuple[str, str, Any]] = [
     ("expenses", "SELECT count(*) FROM expenses", 15),
     ("cost_data", "SELECT count(*) FROM cost_data", 6),
     # cost_data 必须建出 8 业务列（不是 1 列）—— 表头陷阱的回归断言。
-    # 物理列 = 8 业务列 + tenant_id = 9。
+    # 物理列 = 8 业务列 + tenant_id + is_shared = 10。
+    # ⚠️ 加了 is_shared 后这条从 9 变 10（实测：漏改会让真值自检整体失败，
+    #    且失败信息只出现在 problems 列表里，CLI 汇总行不显示 —— 见 L-020）。
     ("cost_data",
      "SELECT count(*) FROM information_schema.columns "
-     "WHERE table_schema='public' AND table_name='cost_data'", 9),
+     "WHERE table_schema='public' AND table_name='cost_data'", 10),
     # 中文列名表必须能按数值列排序（验证中文表头没有破坏列语义）
     ("cost_data",
      "SELECT col_1 FROM cost_data WHERE col_4 IS NOT NULL ORDER BY col_4 DESC LIMIT 1", "PET肤感门板"),
+    # 多租户：演示语料必须标记为共享，否则 fail-closed 策略下所有租户都读不到
+    # （这是"改造完演示突然全空"的直接回归断言）
+    ("employees", "SELECT count(*) FROM employees WHERE is_shared IS TRUE", 10000),
+    ("cost_data", "SELECT count(*) FROM cost_data WHERE is_shared IS TRUE", 6),
 ]
 
 
@@ -393,6 +458,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="从 xlsx 装载 Analytics 业务表（ETL）")
     parser.add_argument("--all", action="store_true", help="装载默认的全部 xlsx")
     parser.add_argument("--file", action="append", default=[], help="指定文件（可多次）")
+    parser.add_argument(
+        "--tenant", type=str, default="",
+        help="数据归属租户；留空表示无归属（仅当 --shared 时才会被读到）",
+    )
+    parser.add_argument(
+        "--shared", action="store_true",
+        help="标记为全公司共享语料（所有租户可见）。默认语料（--all）即共享，"
+             "因为它们是 demo 知识库、不属于任何单一租户",
+    )
     parser.add_argument("--verify", action="store_true", help="装载后跑真值断言")
     args = parser.parse_args()
 
@@ -417,8 +491,16 @@ def main() -> int:
 
     all_results: List[LoadResult] = []
     try:
+        # `--all` 装载的是 demo 知识库语料 —— 它们是**全公司共享**的，
+        # 不属于任何单一租户，因此默认标记为 shared（否则 fail-closed 策略下
+        # 谁都读不到，演示直接崩）。用 --tenant 显式指定则改为租户私有。
+        shared = args.shared or (args.all and not args.tenant)
         for p in targets:
-            all_results += load_file(analytics_engine, rag_engine, p)
+            all_results += load_file(
+                analytics_engine, rag_engine, p,
+                tenant_id=args.tenant, is_shared=shared,
+            )
+        print(f"（归属租户={args.tenant or '无'}，共享={shared}）")
 
         print()
         print("=" * 78)

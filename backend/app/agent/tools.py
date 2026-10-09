@@ -174,11 +174,41 @@ class AgentTools:
 
     # ---- 工具：知识库检索 ----
     def kb_search(self, query: str, top_k: Optional[int] = None,
-                  filter_dict: Optional[Dict[str, Any]] = None) -> ToolOutcome:
-        """复用现有 Retriever。返回结构与 pipeline 一致，便于上层补发 meta 帧。"""
+                  filter_dict: Optional[Dict[str, Any]] = None,
+                  tenant_id: Optional[str] = None) -> ToolOutcome:
+        """复用现有 Retriever。返回结构与 pipeline 一致，便于上层补发 meta 帧。
+
+        ## ⚠️ tenant_id 必须强制注入（一次真实的跨租户泄露）
+
+        初版 `dispatch` 调用本方法时**没有传 tenant_id**，于是
+        `filter_dict` 为 None ⇒ Retriever 不做任何租户过滤
+        ⇒ **Agent 的 kb_search 能看到所有租户的私有向量**。
+
+        实测证据（双租户）：租户 c 通过 `/agent/stream` 提问，
+        拿到了租户 b 私有上传的 xlsx 内容与金额；
+        而同样的问题走经典 `/chat/stream` 则是隔离的（hidden_count=4）。
+
+        根因是两条路径的隔离机制不对称：
+          - 经典 RAG：`api/deps.enforced_filter()` 用 Principal 强制叠加租户键
+          - Agent：        走 tools.dispatch，**绕过了那个依赖**，且没自己注入
+
+        修复：在这里**强制**叠加租户条件，且**不允许调用方覆盖** ——
+        与 `enforced_filter` 同语义（客户端/模型传的 tenant 一律丢弃）。
+        这是"默认拒绝"的写法：只要带了 principal，就一定过滤；
+        宁可少召回，不可跨租户泄露。
+        """
         k = int(top_k) if top_k else settings.top_k
+        # 强制租户隔离：先丢弃调用方可能传入的租户键，再按 principal 写入
+        merged: Dict[str, Any] = dict(filter_dict or {})
+        merged.pop(settings.tenant_field, None)
+        if tenant_id is not None:
+            merged[settings.tenant_field] = tenant_id
+        effective_filter = merged or None
+
         try:
-            chunks, dropped = self.retriever.search(query, top_k=k, filter_dict=filter_dict)
+            chunks, dropped = self.retriever.search(
+                query, top_k=k, filter_dict=effective_filter
+            )
         except Exception as e:  # noqa: BLE001
             detail = describe_exception(e)
             logger.error("[tools] kb_search 失败: %s", detail)
@@ -338,6 +368,9 @@ class AgentTools:
             return self.kb_search(
                 query=str(args.get("query", "")),
                 top_k=args.get("top_k"),
+                # ⚠️ 必须传 tenant_id：漏传会让 Agent 检索绕过租户隔离，
+                #    看到所有租户的私有向量（实测确证过）。
+                tenant_id=tenant_id,
             )
         if name == "sql_query":
             return self.sql_query(

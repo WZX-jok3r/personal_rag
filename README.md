@@ -98,7 +98,49 @@ LLM 生成的 SQL 必须无法伤害数据库。**任何一层单独都不够**�
 | ① AST 白名单 | `sqlglot` 解析后遍历语法树 | 非 SELECT、多语句、系统表、`pg_read_file`、`COPY TO PROGRAM`、`pg_sleep` | 📄 sqlglot 官方 FAQ 自称 *"a transpiler, not a validator"* |
 | ② 只读事务 | `set_config('transaction_read_only','on')` + `statement_timeout` | 漏网写操作、长查询 DoS | 📄 PG 官方承认只读是 *"high-level notion…does not prevent all writes to disk"* |
 | ③ 角色权限 | 独立库 + `kb_ro` 只授 `SELECT` | 任何写企图 | 挡不住"用合法 SELECT 读敏感数据" |
-| ④ 数据隔离 | RLS（`app.tenant_id`）+ RBAC 列脱敏 | 跨租户越权、越权看敏感列 | 需应用正确设置会话变量 |
+| ④ 数据隔离 | RLS（`app.tenant_id`，**fail-closed**）+ RBAC 列脱敏 | 跨租户越权、越权看敏感列 | 需应用正确设置会话变量（故策略本身也做成默认拒绝） |
+
+### 租户隔离的语义（v2，由一次真实越权问题驱动）
+
+早期版本只有 `tenant_id` 一个字段，且策略是 **fail-open** 的
+（`app.tenant_id` 未设置 ⇒ 放行全部行）。实测暴露两个真实缺陷：
+
+- **写入侧**：ETL 把上传数据的 `tenant_id` 硬编码成固定值
+  ⇒ 租户 B 上传后**查不到自己的数据**（"传了但查不到"）
+- **读取侧**：执行器写的是 `if tenant_id:`，未认证时不设置变量
+  ⇒ 策略放行全部 ⇒ 实测租户 B 能读到**全公司 10000 行薪资**
+
+根因是把「归属」与「可见性」挤在一个字段里。现在拆成两个正交概念，
+策略改为 **fail-closed**：
+
+```sql
+USING (is_shared IS TRUE OR tenant_id = current_setting('app.tenant_id', true))
+```
+
+| 数据类别 | `tenant_id` | `is_shared` | 可见范围 |
+|---|---|---|---|
+| 租户私有（API 上传的 xlsx） | 上传租户 | `false` | **仅该租户** |
+| 全公司共享语料（demo 知识库、公司级报表） | — | `true` | 所有租户 |
+
+关键性质：**忘设 `app.tenant_id` 只损失功能，不泄露数据** ——
+只会读不到租户私有数据，拿不到别的租户的任何行。
+执行器也改为**无条件**设置变量（无租户时用哨兵 `@anonymous@`），
+两道一起保证"默认拒绝"。
+
+**双租户实测**（`X-API-Key` 分别为租户 b / c）：
+
+```
+写入侧  secret 表行归属 = b            （不再是硬编码兜底值）
+读 侧   tenant=b → 2 行   c → 0 行   a → 0 行   未设变量 → 0 行
+应用层  b 能查到自己的数据；c 查不到（含 Agent 检索路径）
+```
+
+> ⚠️ 一个值得记录的教训：这个缺陷在测试矩阵里**长期不可见**，
+> 因为唯一的 E2E 用的是 demo key（**租户 a**），
+> 而 a 恰好等于那个硬编码兜底值。**单租户测试对多租户缺陷是结构性盲区**，
+> 不是覆盖不足。修复后新增 `tests/test_tenant_isolation.py`（真连 PG）
+> 与 `tests/test_agent_tenant_isolation.py`（含结构性防复发断言：
+> 穷举代码库所有 `retriever.search(` 调用点，新增未受控路径直接失败）。
 
 **44 条攻击载荷全部拦截**（含 `DROP`、多语句注入、`pg_shadow`、文件读写、命令执行、
 注释混淆、大小写/空白变体），22 条合法查询全部放行。
@@ -167,7 +209,7 @@ Google ADK / DB-GPT）后决定手写约 300 行有界状态机。理由：只�
 | **Valid SQL Rate** | 100%（42/42） | 同上 |
 | **平均生成次数** | 1.00（一次生成即正确） | 同上 |
 | **检索 Recall@5 / MRR** | 99.01% / 0.9703（107 题） | `python -m eval --retrieval-only` |
-| **单测** | **541 passed** | `pytest -q` |
+| **单测** | **597 passed** | `pytest -q` |
 | **SQL 攻击载荷拦截** | 44/44 | `pytest tests/test_sql_guard.py` |
 | **端到端延迟** | SQL 查询 2~5ms；检索路径首帧 <1s | `scripts/check.ps1 -Full` |
 
@@ -272,11 +314,11 @@ backend/
 │   ├── rag/ vector/ ingestion/ llm/ worker/     # 原有 RAG 链路（基本未改）
 │   └── core/             # config / security(RBAC) / retry / exceptions
 ├── eval/                 # 两个评测 runner + 冻结基线
-├── tests/                # 541 项测试
+├── tests/                # 597 项测试
 └── migrations/           # Alembic（元数据表 / 审计 / 用量）
 frontend/src/             # Vue3 SPA（AgentTrace / MessageBubble / ChatView）
 scripts/check.ps1         # 三级验证闸口
-docs/                     # 改造方案 + 数据层设计 + 经验教训（19 条）
+docs/                     # 改造方案 + 数据层设计 + 经验教训（20 条）
 ```
 
 ---
@@ -301,7 +343,7 @@ docs/                     # 改造方案 + 数据层设计 + 经验教训（19 �
 
 ## 九、工程实践与踩坑记录
 
-本项目把**真实踩过的坑**沉淀成了 [docs/经验教训.md](docs/经验教训.md)（19 条），
+本项目把**真实踩过的坑**沉淀成了 [docs/经验教训.md](docs/经验教训.md)（20 条），
 每条都是"现象 → 根因 → 处置 → 可执行的规避规则"。几条最有代表性的：
 
 | # | 坑 | 教训 |
@@ -336,6 +378,6 @@ docs/                     # 改造方案 + 数据层设计 + 经验教训（19 �
 |---|---|
 | [docs/升级为内部知识库Agent-完整改造方案.md](docs/升级为内部知识库Agent-完整改造方案.md) | 完整改造方案：结构梳理、优缺点诊断、可行性调研、8 阶段计划、简历包装 |
 | [docs/text2sql-数据层设计.md](docs/text2sql-数据层设计.md) | 可直接执行的 DDL、只读角色、RLS、ETL 与数据源边界 |
-| [docs/经验教训.md](docs/经验教训.md) | 19 条真实踩坑记录与方法学规则 |
+| [docs/经验教训.md](docs/经验教训.md) | 20 条真实踩坑记录与方法学规则 |
 | [docs/项目全景深度解析.md](docs/项目全景深度解析.md) | 原有 RAG 模块逐一梳理与端到端调用链 |
 | [docs/RAG面试题库_初中高60题.md](docs/RAG面试题库_初中高60题.md) | RAG 面试题库 |
